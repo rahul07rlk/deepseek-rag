@@ -1,0 +1,20 @@
+# PyTorch is installed separately (see scripts/setup.bat) with the CUDA 11.8 wheel.
+# faiss-cpu replaces chromadb/chroma-hnswlib — pre-built wheels, no compiler needed.
+faiss-cpu>=1.7.4
+sentence-transformers==3.0.1
+fastapi==0.111.0
+uvicorn==0.30.1
+httpx==0.27.0
+watchdog==4.0.1
+python-dotenv==1.0.1
+pydantic==2.7.1
+tiktoken==0.7.0
+rich==13.7.1
+rank-bm25==0.2.2
+# Multi-language AST chunking (TS/JS/Go/Rust/Java/C/C++/C#/PHP/Ruby/Swift/Kotlin).
+# Bundled grammars download lazily on first parse.
+tree-sitter-language-pack>=1.6.0
+numpy>=1.24.0,<2.0
+voyageai>=0.2.3
+pytest==8.2.2
+pytest-asyncio==0.23.7
