@@ -35,6 +35,7 @@ from src.config import (
     AGENTIC_MAX_TOOL_TURNS,
     AGENTIC_PARALLEL_TOOL_CALLS,
     DEEPSEEK_API_KEY,
+    DEEPSEEK_MAX_OUTPUT_TOKENS,
     DEEPSEEK_MODEL,
     DEEPSEEK_REASONING_EFFORT,
     DEEPSEEK_THINKING,
@@ -489,7 +490,8 @@ async def proxy_completions(request: Request):
     logger.info(f"Query: {preview}")
 
     model = body.get("model", DEEPSEEK_MODEL)
-    max_tokens = body.get("max_tokens", 8000)
+    requested_max_tokens = int(body.get("max_tokens") or 0)
+    max_tokens = max(requested_max_tokens, DEEPSEEK_MAX_OUTPUT_TOKENS)
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
         "Content-Type": "application/json",

@@ -312,6 +312,15 @@ def schedule_bm25_rebuild() -> None:
         _bm25_rebuild_timer.start()
 
 
+def _update_symbol_graph_for_file(fpath: Path) -> None:
+    try:
+        from src.symbol_graph import update_for_file
+        summary = update_for_file(fpath)
+        logger.debug(f"Symbol graph updated for {fpath.name}: {summary}")
+    except Exception as e:
+        logger.debug(f"symbol-graph per-file update skipped for {fpath}: {e}")
+
+
 # ── Indexing ──────────────────────────────────────────────────────────────────
 def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) -> None:
     if isinstance(repo_paths, Path):
@@ -332,6 +341,14 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
         return
 
     repo_name_map: dict[str, str] = {str(rp): rp.name for rp in repo_paths}
+    discovered_file_strs = {str(fpath) for fpath in files}
+    removed_missing = 0
+    for indexed_file in store.get_indexed_files():
+        if indexed_file not in discovered_file_strs:
+            removed_missing += store.delete_by_file(indexed_file)
+    if removed_missing:
+        logger.info(f"Removed {removed_missing} chunks for files no longer on disk")
+    removed_replaced = 0
 
     new_docs: list[str] = []
     new_ids: list[str] = []
@@ -352,10 +369,10 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
             if stored_hash == fhash:
                 skipped += 1
                 continue
-            store.delete_by_file(file_str)
+            removed_replaced += store.delete_by_file(file_str)
             updated += 1
         elif force and existing_ids:
-            store.delete_by_file(file_str)
+            removed_replaced += store.delete_by_file(file_str)
 
         chunks = chunk_file(fpath)
         language = _language(fpath)
@@ -380,16 +397,25 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
     new_count = len(files) - skipped - updated
     logger.info(
         f"Files: {len(files)} total | {skipped} unchanged | "
-        f"{updated} updated | {new_count} new"
+        f"{updated} updated | {new_count} new | "
+        f"{removed_missing} missing-file chunks removed"
     )
 
     if not new_docs:
         logger.info("Nothing new to embed. Index is up to date.")
-        if not BM25_CACHE.exists():
+        store_changed = removed_missing > 0 or removed_replaced > 0
+        if store_changed:
+            store.save()
+        if store_changed or not BM25_CACHE.exists():
             rebuild_bm25_cache()
             try:
                 from src.repo_map import build_repo_map
                 build_repo_map()
+            except Exception:
+                pass
+            try:
+                from src.symbol_graph import build_symbol_graph
+                build_symbol_graph()
             except Exception:
                 pass
         return
@@ -435,32 +461,47 @@ def index_single_file(filepath: str | Path) -> None:
         return
     if any(part in IGNORED_DIRS for part in fpath.parts):
         return
-    skip, reason = _is_noise(fpath) if fpath.exists() else (False, "")
-    if skip:
-        logger.debug(f"Skipping {fpath.name}: {reason}")
-        return
 
     store = get_store()
     file_str = str(fpath)
 
     if not fpath.exists():
         removed = store.delete_by_file(file_str)
+        _update_symbol_graph_for_file(fpath)
         if removed:
             store.save()
             logger.info(f"Removed {removed} chunks for deleted {fpath.name}")
             schedule_bm25_rebuild()
         return
 
-    logger.info(f"Re-indexing: {fpath.name}")
-    model = get_model()
+    skip, reason = _is_noise(fpath)
+    if skip:
+        removed = store.delete_by_file(file_str)
+        _update_symbol_graph_for_file(fpath)
+        if removed:
+            store.save()
+            logger.info(
+                f"Removed {removed} chunks for no-longer-indexable "
+                f"{fpath.name}: {reason}"
+            )
+            schedule_bm25_rebuild()
+        else:
+            logger.debug(f"Skipping {fpath.name}: {reason}")
+        return
 
-    store.delete_by_file(file_str)
+    logger.info(f"Re-indexing: {fpath.name}")
+    removed = store.delete_by_file(file_str)
 
     chunks = chunk_file(fpath)
     if not chunks:
+        _update_symbol_graph_for_file(fpath)
+        if removed:
+            store.save()
+            schedule_bm25_rebuild()
         logger.warning(f"No chunks produced for {fpath.name}")
         return
 
+    model = get_model()
     fhash = _file_hash(fpath)
     language = _language(fpath)
     repo_name = next(
@@ -487,6 +528,7 @@ def index_single_file(filepath: str | Path) -> None:
     embs = model.encode(docs, normalize_embeddings=True, show_progress_bar=False)
     store.add(ids, docs, embs, metas)
     store.save()
+    _update_symbol_graph_for_file(fpath)
     logger.info(f"Re-indexed {len(docs)} chunks from {fpath.name}")
     schedule_bm25_rebuild()
 

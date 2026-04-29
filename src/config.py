@@ -185,6 +185,7 @@ DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
 # deepseek-v4-flash: fast, thinking ON by default, 1M ctx ($0.14/1M in cache miss)
 # deepseek-v4-pro:   best quality, 1M ctx ($1.74/1M in cache miss)
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "100000"))
 
 # Thinking mode: "enabled" (default) or "disabled".
 # When enabled: temperature/top_p are ignored; reasoning_content is returned alongside content.

@@ -8,6 +8,7 @@ Replaces ChromaDB. Uses IndexIDMap2(IndexFlatIP) so that:
 Persistence layout inside INDEX_DIR:
   faiss.index      - FAISS binary index
   store_meta.json  - all chunk text + metadata, keyed by integer FAISS ID
+  index_state.json - file path -> FAISS integer IDs for fast incremental deletes
 """
 from __future__ import annotations
 
@@ -21,18 +22,24 @@ import numpy as np
 class VectorStore:
     _INDEX_FILE = "faiss.index"
     _META_FILE = "store_meta.json"
+    _STATE_FILE = "index_state.json"
+    _STATE_VERSION = 1
 
     def __init__(self, index_dir: Path, dim: int, embed_model: str = "") -> None:
         self._dir = index_dir
         self._dim = dim
         self._embed_model = embed_model
+        self._dir.mkdir(parents=True, exist_ok=True)
         self._index_path = index_dir / self._INDEX_FILE
         self._meta_path = index_dir / self._META_FILE
+        self._state_path = index_dir / self._STATE_FILE
 
         # int_id -> {"str_id": str, "doc": str, "meta": dict}
         self._data: dict[int, dict] = {}
         # str_id -> int_id  (reverse lookup)
         self._str_to_int: dict[str, int] = {}
+        # file path -> [int_id, ...]  (sidecar-backed reverse lookup)
+        self._file_to_int_ids: dict[str, list[int]] = {}
         self._next_id: int = 0
 
         self._load()
@@ -63,6 +70,7 @@ class VectorStore:
                 # see a non-empty self._data that's now misaligned with FAISS.
                 self._data.clear()
                 self._str_to_int.clear()
+                self._file_to_int_ids.clear()
                 self._next_id = 0
                 return
             self._index = faiss.read_index(str(self._index_path))
@@ -72,8 +80,66 @@ class VectorStore:
                 iid = int(k)
                 self._data[iid] = v
                 self._str_to_int[v["str_id"]] = iid
+            self._load_or_repair_file_state()
         else:
             self._index = self._make_index()
+
+    def _state_from_metadata(self) -> dict[str, list[int]]:
+        file_state: dict[str, list[int]] = {}
+        for iid, v in self._data.items():
+            file_str = v.get("meta", {}).get("file")
+            if not file_str:
+                continue
+            file_state.setdefault(file_str, []).append(iid)
+        for ids in file_state.values():
+            ids.sort()
+        return file_state
+
+    def _load_or_repair_file_state(self) -> None:
+        """Load index_state.json, repairing drift from store_meta.json.
+
+        Older indexes did not have a sidecar, and interrupted writes can leave
+        any two persisted files slightly out of sync. The metadata file is the
+        source of truth for chunk payloads, so we validate the sidecar against
+        it and backfill anything missing.
+        """
+        rebuilt = self._state_from_metadata()
+        if not self._state_path.exists():
+            self._file_to_int_ids = rebuilt
+            return
+
+        try:
+            with open(self._state_path, encoding="utf-8") as f:
+                saved = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            self._file_to_int_ids = rebuilt
+            return
+
+        loaded: dict[str, list[int]] = {}
+        raw_files = saved.get("files", {})
+        if isinstance(raw_files, dict):
+            for file_str, raw_ids in raw_files.items():
+                if not isinstance(raw_ids, list):
+                    continue
+                clean_ids: list[int] = []
+                for raw_iid in raw_ids:
+                    try:
+                        iid = int(raw_iid)
+                    except (TypeError, ValueError):
+                        continue
+                    item = self._data.get(iid)
+                    if item and item.get("meta", {}).get("file") == file_str:
+                        clean_ids.append(iid)
+                if clean_ids:
+                    loaded[file_str] = sorted(set(clean_ids))
+
+        # Backfill any valid chunks missing from the sidecar.
+        for file_str, ids in rebuilt.items():
+            merged = set(loaded.get(file_str, []))
+            merged.update(ids)
+            loaded[file_str] = sorted(merged)
+
+        self._file_to_int_ids = loaded
 
     def save(self) -> None:
         faiss.write_index(self._index, str(self._index_path))
@@ -84,6 +150,20 @@ class VectorStore:
                     "embed_model": self._embed_model,
                     "count": len(self._data),
                     "data": {str(k): v for k, v in self._data.items()},
+                },
+                f,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        with open(self._state_path, "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "version": self._STATE_VERSION,
+                    "files": {
+                        file_str: ids
+                        for file_str, ids in sorted(self._file_to_int_ids.items())
+                        if ids
+                    },
                 },
                 f,
                 ensure_ascii=False,
@@ -101,6 +181,26 @@ class VectorStore:
     ) -> None:
         if not str_ids:
             return
+        if len(set(str_ids)) != len(str_ids):
+            raise ValueError("str_ids must be unique within a single add() call")
+        if not (len(str_ids) == len(docs) == len(metadatas)):
+            raise ValueError("str_ids, docs, and metadatas must have matching lengths")
+
+        vecs = np.asarray(embeddings, dtype=np.float32)
+        if vecs.ndim != 2 or vecs.shape[0] != len(str_ids) or vecs.shape[1] != self._dim:
+            raise ValueError(
+                "embeddings must have shape "
+                f"({len(str_ids)}, {self._dim}); got {vecs.shape}"
+            )
+
+        existing = [
+            self._str_to_int[str_id]
+            for str_id in str_ids
+            if str_id in self._str_to_int
+        ]
+        if existing:
+            self._remove_int_ids(existing)
+
         int_ids: list[int] = []
         for str_id in str_ids:
             iid = self._next_id
@@ -110,24 +210,46 @@ class VectorStore:
 
         for iid, str_id, doc, meta in zip(int_ids, str_ids, docs, metadatas):
             self._data[iid] = {"str_id": str_id, "doc": doc, "meta": meta}
+            file_str = meta.get("file")
+            if file_str:
+                self._file_to_int_ids.setdefault(file_str, []).append(iid)
 
-        vecs = np.asarray(embeddings, dtype=np.float32)
         self._index.add_with_ids(vecs, np.array(int_ids, dtype=np.int64))
+
+    def _remove_int_ids(self, int_ids: list[int]) -> int:
+        to_remove = sorted({int(iid) for iid in int_ids if int(iid) in self._data})
+        if not to_remove:
+            return 0
+
+        self._index.remove_ids(np.array(to_remove, dtype=np.int64))
+        for iid in to_remove:
+            item = self._data.pop(iid)
+            self._str_to_int.pop(item["str_id"], None)
+            file_str = item.get("meta", {}).get("file")
+            if file_str in self._file_to_int_ids:
+                remaining = [
+                    existing_iid
+                    for existing_iid in self._file_to_int_ids[file_str]
+                    if existing_iid != iid
+                ]
+                if remaining:
+                    self._file_to_int_ids[file_str] = remaining
+                else:
+                    self._file_to_int_ids.pop(file_str, None)
+        return len(to_remove)
 
     def delete_by_file(self, file_str: str) -> int:
         """Remove all chunks for file_str. Returns number of chunks removed."""
-        to_remove = [
-            iid for iid, v in self._data.items()
-            if v["meta"].get("file") == file_str
-        ]
-        if not to_remove:
-            return 0
-        self._index.remove_ids(np.array(to_remove, dtype=np.int64))
-        for iid in to_remove:
-            str_id = self._data[iid]["str_id"]
-            self._str_to_int.pop(str_id, None)
-            del self._data[iid]
-        return len(to_remove)
+        to_remove = list(self._file_to_int_ids.get(file_str, []))
+
+        # Drift repair fallback for pre-sidecar stores or interrupted writes.
+        known = set(to_remove)
+        for iid, v in self._data.items():
+            if iid not in known and v.get("meta", {}).get("file") == file_str:
+                to_remove.append(iid)
+                known.add(iid)
+
+        return self._remove_int_ids(to_remove)
 
     def delete_by_file_prefix(self, file_str: str) -> int:
         """Alias kept for clarity; same as delete_by_file."""
@@ -167,10 +289,32 @@ class VectorStore:
 
     def get_by_file(self, file_str: str) -> list[str]:
         """Return str_ids of all chunks for file_str."""
-        return [
-            v["str_id"] for v in self._data.values()
-            if v["meta"].get("file") == file_str
-        ]
+        out: list[str] = []
+        seen: set[str] = set()
+        for iid in self._file_to_int_ids.get(file_str, []):
+            v = self._data.get(iid)
+            if v and v.get("meta", {}).get("file") == file_str:
+                out.append(v["str_id"])
+                seen.add(v["str_id"])
+
+        # Same repair fallback as delete_by_file, but read-only.
+        for v in self._data.values():
+            if v.get("meta", {}).get("file") != file_str:
+                continue
+            str_id = v["str_id"]
+            if str_id not in seen:
+                out.append(str_id)
+                seen.add(str_id)
+        return out
+
+    def get_indexed_files(self) -> list[str]:
+        """Return all file paths currently represented in the index."""
+        files = set(self._file_to_int_ids)
+        for v in self._data.values():
+            file_str = v.get("meta", {}).get("file")
+            if file_str:
+                files.add(file_str)
+        return sorted(files)
 
     def get_all(self) -> tuple[list[str], list[str], list[dict]]:
         """Return (str_ids, docs, metas) for every stored chunk."""

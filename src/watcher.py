@@ -55,6 +55,24 @@ class CodeChangeHandler(FileSystemEventHandler):
         except Exception as e:
             logger.exception(f"Failed to clean up {event.src_path}: {e}")
 
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        if self._should_process(event.src_path):
+            logger.info(f"File moved/deleted: {Path(event.src_path).name}")
+            try:
+                index_single_file(event.src_path)
+            except Exception as e:
+                logger.exception(f"Failed to clean up {event.src_path}: {e}")
+        if self._should_process(event.dest_path):
+            if self._debounced(event.dest_path):
+                return
+            logger.info(f"File moved/created: {Path(event.dest_path).name}")
+            try:
+                index_single_file(event.dest_path)
+            except Exception as e:
+                logger.exception(f"Failed to re-index {event.dest_path}: {e}")
+
 
 def start_watcher(repo_paths: list[Path] | Path = REPO_PATHS) -> None:
     if isinstance(repo_paths, Path):
