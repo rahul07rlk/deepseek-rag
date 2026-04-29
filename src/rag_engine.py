@@ -28,6 +28,7 @@ Pipeline (all stages are independently toggleable via env):
 from __future__ import annotations
 
 import pickle
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -35,7 +36,13 @@ import numpy as np
 
 from src.config import (
     BM25_CACHE,
+    CALL_GRAPH_EXPANSION_ENABLED,
+    CALL_GRAPH_MAX_NEIGHBORS,
+    CALL_GRAPH_TOKEN_BUDGET,
     CANDIDATE_POOL,
+    CONVERSATION_AWARE_RETRIEVAL,
+    CONVERSATION_HISTORY_MAX_CHARS,
+    CONVERSATION_VAGUE_QUERY_CHARS,
     HYBRID_ALPHA,
     LOW_CONFIDENCE_THRESHOLD,
     MIN_RELEVANCE_SCORE,
@@ -231,6 +238,15 @@ def _format_block(meta: dict, body: str, header_extra: str = "") -> str:
     return f"{header}```{meta['language']}\n{body}\n```"
 
 
+def _graph_header_extra(meta: dict) -> str:
+    relation = meta.get("graph_relation")
+    if not relation:
+        return ""
+    symbol = meta.get("graph_symbol") or meta.get("symbol") or ""
+    suffix = f": `{symbol}`" if symbol else ""
+    return f" | **Graph:** {relation}{suffix}"
+
+
 def _apply_query_boosts(
     fused: list[tuple[str, float]],
     by_id: dict[str, tuple[str, dict]],
@@ -349,6 +365,179 @@ def _merge_ranges(
     return merged
 
 
+def _chunk_covering_line(
+    chunks_by_file: dict[str, list[tuple[str, str, dict]]],
+    file_path: str,
+    line: int,
+) -> tuple[str, str, dict] | None:
+    candidates = chunks_by_file.get(file_path)
+    if not candidates:
+        return None
+
+    nearest: tuple[int, tuple[str, str, dict]] | None = None
+    for item in candidates:
+        _doc_id, _doc, meta = item
+        start = int(meta.get("start_line") or 1)
+        end = int(meta.get("end_line") or start)
+        if start <= line <= end:
+            return item
+        distance = min(abs(line - start), abs(line - end))
+        if nearest is None or distance < nearest[0]:
+            nearest = (distance, item)
+    return nearest[1] if nearest else None
+
+
+def _expand_ranked_with_call_graph(
+    ranked: list[tuple[str, float, float, str, dict]],
+) -> list[tuple[str, float, float, str, dict]]:
+    if not CALL_GRAPH_EXPANSION_ENABLED or not ranked or CALL_GRAPH_MAX_NEIGHBORS <= 0:
+        return ranked
+
+    try:
+        from src.symbol_graph import neighbors_for_chunk
+    except Exception as e:
+        logger.debug(f"Call-graph expansion unavailable: {e}")
+        return ranked
+
+    all_ids, all_docs, all_metas = get_store().get_all()
+    chunks_by_file: dict[str, list[tuple[str, str, dict]]] = {}
+    for doc_id, doc, meta in zip(all_ids, all_docs, all_metas):
+        chunks_by_file.setdefault(meta.get("file", ""), []).append((doc_id, doc, meta))
+    for chunks in chunks_by_file.values():
+        chunks.sort(key=lambda item: int(item[2].get("start_line") or 1))
+
+    existing_ids = {doc_id for doc_id, *_ in ranked}
+    additions: list[tuple[str, float, float, str, dict]] = []
+    graph_tokens = 0
+
+    for _doc_id, primary, secondary, _doc, meta in ranked:
+        if len(additions) >= CALL_GRAPH_MAX_NEIGHBORS:
+            break
+        try:
+            neighbors = neighbors_for_chunk(
+                file=meta.get("file", ""),
+                symbol=meta.get("symbol", ""),
+                start_line=int(meta.get("start_line") or 1),
+                end_line=int(meta.get("end_line") or meta.get("start_line") or 1),
+                limit=max(CALL_GRAPH_MAX_NEIGHBORS * 2, 8),
+            )
+        except Exception as e:
+            logger.debug(f"Call-graph lookup failed: {e}")
+            continue
+
+        for neighbor in neighbors:
+            if len(additions) >= CALL_GRAPH_MAX_NEIGHBORS:
+                break
+            candidate = _chunk_covering_line(
+                chunks_by_file,
+                neighbor.get("file", ""),
+                int(neighbor.get("line") or 1),
+            )
+            if candidate is None:
+                continue
+            neighbor_id, neighbor_doc, neighbor_meta = candidate
+            if neighbor_id in existing_ids:
+                continue
+
+            expanded_meta = {
+                **neighbor_meta,
+                "graph_relation": neighbor.get("relation", ""),
+                "graph_symbol": neighbor.get("symbol", ""),
+            }
+            token_estimate = count_tokens(
+                _format_block(
+                    expanded_meta,
+                    neighbor_doc,
+                    _graph_header_extra(expanded_meta),
+                )
+            )
+            if graph_tokens + token_estimate > CALL_GRAPH_TOKEN_BUDGET:
+                return ranked + additions
+
+            existing_ids.add(neighbor_id)
+            graph_tokens += token_estimate
+            additions.append(
+                (
+                    neighbor_id,
+                    max(primary * 0.85, MIN_RELEVANCE_SCORE),
+                    secondary * 0.85,
+                    neighbor_doc,
+                    expanded_meta,
+                )
+            )
+
+    if additions:
+        logger.info(f"Call-graph expansion added {len(additions)} neighbor chunks")
+    return ranked + additions
+
+
+_VAGUE_FOLLOWUP_MARKERS = (
+    "fix it", "still wrong", "wrong", "same issue", "that issue",
+    "this issue", "try again", "continue", "do it", "not working",
+    "it fails", "still fails", "what about that", "above",
+)
+
+
+def _history_excerpt_for_retrieval(conversation_history: list[dict] | None) -> str:
+    if not conversation_history:
+        return ""
+    last_assistant = ""
+    for msg in reversed(conversation_history):
+        if msg.get("role") == "assistant" and msg.get("content"):
+            last_assistant = str(msg["content"])
+            break
+    if not last_assistant:
+        return ""
+
+    snippets: list[str] = []
+    snippets.extend(m.group(1).strip() for m in re.finditer(
+        r"```(?:[\w+-]+)?\n(.*?)```", last_assistant, flags=re.S
+    ))
+
+    interesting_lines: list[str] = []
+    for line in last_assistant.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.search(
+            r"(error|exception|traceback|failed|failing|assert|TODO|\.py|\.ts|\.tsx|\.js|\.json|line \d+)",
+            stripped,
+            flags=re.I,
+        ):
+            interesting_lines.append(stripped)
+    if interesting_lines:
+        snippets.append("\n".join(interesting_lines[:30]))
+
+    if not snippets:
+        snippets.append(last_assistant[-CONVERSATION_HISTORY_MAX_CHARS:])
+
+    excerpt = "\n\n".join(s for s in snippets if s)
+    return excerpt[:CONVERSATION_HISTORY_MAX_CHARS].strip()
+
+
+def _conversation_aware_query(
+    query: str,
+    conversation_history: list[dict] | None,
+) -> tuple[str, bool]:
+    if not CONVERSATION_AWARE_RETRIEVAL:
+        return query, False
+    q = (query or "").strip()
+    lower = q.lower()
+    is_vague = (
+        len(q) <= CONVERSATION_VAGUE_QUERY_CHARS
+        or any(marker in lower for marker in _VAGUE_FOLLOWUP_MARKERS)
+    )
+    if not is_vague:
+        return query, False
+    excerpt = _history_excerpt_for_retrieval(conversation_history)
+    if not excerpt:
+        return query, False
+    return (
+        f"{query}\n\nPrevious assistant context for retrieval:\n{excerpt}",
+        True,
+    )
+
+
 # ── Main retrieval ────────────────────────────────────────────────────────────
 def retrieve(
     query: str,
@@ -357,6 +546,7 @@ def retrieve(
     token_budget: int = TOKEN_BUDGET,
     vector_query_override: str | None = None,
     use_multi_query: bool | None = None,
+    conversation_history: list[dict] | None = None,
 ) -> tuple[str, int, list[dict]]:
     """Return ``(context_string, token_count, list_of_used_block_metas)``.
 
@@ -374,33 +564,44 @@ def retrieve(
             embedder loves but BM25 doesn't.
         use_multi_query: when True (or default-on via MULTI_QUERY_ENABLED),
             generate rule-based query variants and RRF-fuse their hits.
+        conversation_history: optional prior user/assistant turns. Short,
+            self-referential follow-ups are enriched with the last assistant
+            code/error snippets before retrieval.
 
     The last ``meta`` in the return list carries an extra ``"confidence"``
     field (top rerank score 0..1) that the seed builder can use to flag
     low-signal retrievals for the LLM.
     """
     # ── Stage 1: query analysis (adaptive alpha + boost targets). ─────────────
+    retrieval_query, conversation_enriched = _conversation_aware_query(
+        query, conversation_history
+    )
+    if conversation_enriched:
+        logger.info("Conversation-aware retrieval enriched a vague follow-up query")
+
     if QUERY_ANALYSIS_ENABLED:
-        analysis = analyze_query(query)
+        analysis = analyze_query(retrieval_query)
         effective_alpha = analysis.alpha
     else:
-        analysis = QueryAnalysis(raw_query=query, alpha=alpha)
+        analysis = QueryAnalysis(raw_query=retrieval_query, alpha=alpha)
         effective_alpha = alpha
 
     # ── Stage 1.25: query expansion. ──────────────────────────────────────────
     # The vector side is allowed to swap out the query (HyDE). The BM25 side
     # always uses the original — keyword vocabulary should match what the
     # user actually typed, not a paraphrase.
-    vector_query = vector_query_override or query
+    vector_query = vector_query_override or retrieval_query
+    if vector_query_override and conversation_enriched:
+        vector_query = f"{vector_query_override}\n\n{retrieval_query}"
     do_multi = MULTI_QUERY_ENABLED if use_multi_query is None else use_multi_query
     if do_multi:
         from src.multi_query import expand as expand_queries
 
         vector_variants = expand_queries(vector_query, analysis, MULTI_QUERY_VARIANTS)
-        bm25_variants = expand_queries(query, analysis, MULTI_QUERY_VARIANTS)
+        bm25_variants = expand_queries(retrieval_query, analysis, MULTI_QUERY_VARIANTS)
     else:
         vector_variants = [vector_query]
-        bm25_variants = [query]
+        bm25_variants = [retrieval_query]
 
     vec_hits, vec_sim = _multi_query_recall(vector_variants, CANDIDATE_POOL)
     bm_hits = _multi_query_bm25(bm25_variants, CANDIDATE_POOL)
@@ -441,7 +642,7 @@ def retrieve(
     ranked: list[tuple[str, float, float, str, dict]] = []
     confidence: float = 0.0
     if RERANKER_ENABLED:
-        reranked = _rerank_candidates(query, materialized)
+        reranked = _rerank_candidates(retrieval_query, materialized)
         if reranked is not None:
             ranked, confidence = reranked
             rerank_mode = "on"
@@ -459,6 +660,8 @@ def retrieve(
     if not ranked:
         logger.warning("All candidates filtered out (reranker=%s).", rerank_mode)
         return "", 0, []
+
+    ranked = _expand_ranked_with_call_graph(ranked)
 
     # ── Group by file, preserving the chosen rank order. ──────────────────────
     # file_hits[file] = list of (secondary, primary, doc, meta), best first.
@@ -506,6 +709,7 @@ def retrieve(
                     f" | **Relevance:** {best_relevance:.2f}"
                     f" | **Fused:** {top_score:.3f}"
                     f" | **Mode:** whole-file ({len(hits)} hits)"
+                    f"{_graph_header_extra(meta)}"
                 )
                 formatted = _format_block(meta, full_text, header_extra)
                 tokens = count_tokens(formatted)
@@ -553,6 +757,7 @@ def retrieve(
                     f" | **Relevance:** {best_relevance:.2f}"
                     f" | **Fused:** {top_score:.3f}"
                     f" | **Mode:** expanded (+{NEIGHBOR_PAD_LINES} lines)"
+                    f"{_graph_header_extra(meta)}"
                 )
                 formatted = _format_block(meta, body, header_extra)
                 tokens = count_tokens(formatted)
@@ -577,6 +782,7 @@ def retrieve(
             header_extra = (
                 f" | **Relevance:** {relevance:.2f}"
                 f" | **Fused:** {fused_score:.3f}"
+                f"{_graph_header_extra(meta)}"
             )
             formatted = _format_block(meta, doc, header_extra)
             tokens = count_tokens(formatted)
@@ -635,7 +841,9 @@ def build_messages(
     DeepSeek tool-use loop fails.
     """
     context_str, token_count, metas = retrieve(
-        user_query, token_budget=token_budget or TOKEN_BUDGET
+        user_query,
+        token_budget=token_budget or TOKEN_BUDGET,
+        conversation_history=conversation_history,
     )
 
     files_cited = sorted({m["file"] for m in metas})

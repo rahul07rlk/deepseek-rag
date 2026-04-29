@@ -507,6 +507,7 @@ def build_seed_messages(
             token_budget=seed_token_budget,
             vector_query_override=vector_query_override,
             use_multi_query=use_multi,
+            conversation_history=conversation_history,
         )
         if seed_ctx:
             files_cited = sorted({m["file"] for m in metas})

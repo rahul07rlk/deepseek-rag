@@ -406,6 +406,99 @@ def find_importers(target_substring: str, limit: int = 50) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def neighbors_for_chunk(
+    file: str,
+    symbol: str = "",
+    start_line: int = 1,
+    end_line: int = 1,
+    limit: int = 12,
+) -> list[dict]:
+    """Best-effort 1-hop graph neighbors for a retrieved chunk.
+
+    Returns rows shaped as:
+      {"relation": "caller"|"callee"|"importer", "file": str,
+       "line": int, "symbol": str, "repo": str}
+
+    The graph is intentionally approximate: refs are token-based, so this
+    favors recall and leaves final relevance to token budget + reranking.
+    """
+    if not DB_PATH.exists():
+        return []
+
+    out: list[dict] = []
+    seen: set[tuple[str, int, str, str]] = set()
+
+    def add(relation: str, row, sym: str) -> None:
+        if len(out) >= limit:
+            return
+        line = int(row["line"] or 1)
+        key = (relation, row["file"], line, sym)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({
+            "relation": relation,
+            "file": row["file"],
+            "line": line,
+            "symbol": sym,
+            "repo": row["repo"],
+        })
+
+    simple_symbol = (symbol or "").strip()
+    if simple_symbol.startswith("class "):
+        simple_symbol = simple_symbol.split(" ", 1)[1]
+    if "." in simple_symbol:
+        simple_symbol = simple_symbol.rsplit(".", 1)[-1]
+    if simple_symbol.startswith("<"):
+        simple_symbol = ""
+
+    with _txn() as conn:
+        if simple_symbol:
+            caller_rows = conn.execute(
+                "SELECT symbol,file,line,repo FROM refs "
+                "WHERE symbol = ? AND file != ? LIMIT ?",
+                (simple_symbol, file, max(limit * 3, 50)),
+            ).fetchall()
+            for row in caller_rows:
+                add("caller", row, simple_symbol)
+                if len(out) >= limit:
+                    return out
+
+        callee_rows = conn.execute(
+            """
+            SELECT DISTINCT r.symbol AS symbol,
+                            d.file AS file,
+                            d.start_line AS line,
+                            d.repo AS repo
+            FROM refs r
+            JOIN definitions d ON d.symbol = r.symbol
+            WHERE r.file = ?
+              AND r.line BETWEEN ? AND ?
+              AND d.file != ?
+            LIMIT ?
+            """,
+            (file, start_line, end_line, file, max(limit * 3, 50)),
+        ).fetchall()
+        for row in callee_rows:
+            add("callee", row, row["symbol"])
+            if len(out) >= limit:
+                return out
+
+        stem = Path(file).stem
+        if stem:
+            importer_rows = conn.execute(
+                "SELECT DISTINCT file,target,line,repo FROM imports "
+                "WHERE file != ? AND target LIKE ? LIMIT ?",
+                (file, f"%{stem}%", max(limit * 2, 30)),
+            ).fetchall()
+            for row in importer_rows:
+                add("importer", row, row["target"])
+                if len(out) >= limit:
+                    return out
+
+    return out
+
+
 def graph_stats() -> dict:
     if not DB_PATH.exists():
         return {"definitions": 0, "refs": 0, "imports": 0}

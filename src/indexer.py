@@ -21,10 +21,16 @@ from src.chunker import chunk_file
 from src.config import (
     BM25_CACHE,
     BM25_REBUILD_DEBOUNCE_S,
+    CONTEXTUAL_LLM_MIN_CHUNK_CHARS,
+    CONTEXTUAL_PREFIX_MAX_CHARS,
+    CONTEXTUAL_RETRIEVAL_MODE,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_URL,
     EMBED_BATCH_SIZE,
     EMBED_DEVICE,
     EMBED_MODEL,
     EMBED_PROVIDER,
+    HYDE_MODEL,
     IGNORED_DIRS,
     IGNORED_FILENAMES,
     IGNORED_SUFFIXES,
@@ -181,6 +187,110 @@ _LANG = {
 
 def _language(filepath: Path) -> str:
     return _LANG.get(filepath.suffix, filepath.suffix.lstrip("."))
+
+
+def _context_version() -> str:
+    return f"{CONTEXTUAL_RETRIEVAL_MODE}:{CONTEXTUAL_PREFIX_MAX_CHARS}"
+
+
+def _repo_relative_path(fpath: Path) -> str:
+    for repo in REPO_PATHS:
+        try:
+            return f"{repo.name}/{fpath.relative_to(repo).as_posix()}"
+        except ValueError:
+            continue
+    return str(fpath)
+
+
+def _rules_contextual_prefix(
+    fpath: Path,
+    chunk: dict,
+    language: str,
+    repo_name: str,
+) -> str:
+    rel = _repo_relative_path(fpath)
+    symbol = chunk.get("symbol") or "a line-window chunk"
+    start = chunk.get("start_line", "?")
+    end = chunk.get("end_line", "?")
+    prefix = (
+        f"This chunk is from {rel} in the {repo_name} repo, "
+        f"a {language} file, covering {symbol} at lines {start}-{end}."
+    )
+    return prefix[:CONTEXTUAL_PREFIX_MAX_CHARS].rstrip()
+
+
+def _llm_contextual_prefix(
+    fpath: Path,
+    chunk: dict,
+    language: str,
+    repo_name: str,
+) -> str | None:
+    if len(chunk.get("text", "")) < CONTEXTUAL_LLM_MIN_CHUNK_CHARS:
+        return None
+    try:
+        import httpx
+    except Exception:
+        return None
+
+    rel = _repo_relative_path(fpath)
+    symbol = chunk.get("symbol") or ""
+    snippet = chunk.get("text", "")[:1800]
+    prompt = (
+        "Write one concise sentence, 35 words max, that contextualizes this "
+        "code chunk for semantic code search. Include the file path, symbol, "
+        "and likely role when inferable. Return only the sentence.\n\n"
+        f"Repo: {repo_name}\nPath: {rel}\nLanguage: {language}\n"
+        f"Symbol: {symbol}\nCode:\n{snippet}"
+    )
+    try:
+        resp = httpx.post(
+            DEEPSEEK_URL,
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": HYDE_MODEL,
+                "messages": [
+                    {"role": "system", "content": "You create compact code-search context."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": 80,
+                "temperature": 0,
+            },
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        text = (
+            (data.get("choices") or [{}])[0]
+            .get("message", {})
+            .get("content", "")
+            .strip()
+        )
+    except Exception:
+        return None
+    return text[:CONTEXTUAL_PREFIX_MAX_CHARS].rstrip() or None
+
+
+def _contextualized_doc(
+    fpath: Path,
+    chunk: dict,
+    language: str,
+    repo_name: str,
+) -> tuple[str, str]:
+    """Return (text_to_embed, prefix). Stored docs stay raw for display."""
+    raw = chunk["text"]
+    if CONTEXTUAL_RETRIEVAL_MODE == "off":
+        return raw, ""
+
+    prefix: str | None = None
+    if CONTEXTUAL_RETRIEVAL_MODE == "llm":
+        prefix = _llm_contextual_prefix(fpath, chunk, language, repo_name)
+    if not prefix:
+        prefix = _rules_contextual_prefix(fpath, chunk, language, repo_name)
+    return f"{prefix}\n\n{raw}", prefix
 
 
 def _is_noise(fpath: Path) -> tuple[bool, str]:
@@ -351,11 +461,12 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
     removed_replaced = 0
 
     new_docs: list[str] = []
+    new_embed_docs: list[str] = []
     new_ids: list[str] = []
     new_metas: list[dict] = []
-    new_embs: list[np.ndarray] = []
     skipped = 0
     updated = 0
+    context_version = _context_version()
 
     for fpath in files:
         file_str = str(fpath)
@@ -365,8 +476,10 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
         if not force and existing_ids:
             # Check hash of any stored chunk for this file.
             by_id = store.get_by_str_ids([existing_ids[0]])
-            stored_hash = by_id.get(existing_ids[0], (None, {}))[1].get("hash", "")
-            if stored_hash == fhash:
+            stored_meta = by_id.get(existing_ids[0], (None, {}))[1]
+            stored_hash = stored_meta.get("hash", "")
+            stored_context = stored_meta.get("contextual_version", "")
+            if stored_hash == fhash and stored_context == context_version:
                 skipped += 1
                 continue
             removed_replaced += store.delete_by_file(file_str)
@@ -381,7 +494,11 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
             fpath.parts[0] if fpath.parts else "unknown",
         )
         for i, ch in enumerate(chunks):
+            embed_doc, contextual_prefix = _contextualized_doc(
+                fpath, ch, language, repo_name
+            )
             new_docs.append(ch["text"])
+            new_embed_docs.append(embed_doc)
             new_ids.append(f"{file_str}::chunk_{i}")
             new_metas.append({
                 "file": file_str,
@@ -392,6 +509,8 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
                 "end_line": ch["end_line"],
                 "symbol": ch.get("symbol") or "",
                 "hash": fhash,
+                "contextual_version": context_version,
+                "contextual_prefix": contextual_prefix,
             })
 
     new_count = len(files) - skipped - updated
@@ -427,7 +546,7 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
     for batch_start in range(0, len(new_docs), EMBED_BATCH_SIZE):
         batch_num = batch_start // EMBED_BATCH_SIZE + 1
         end = min(batch_start + EMBED_BATCH_SIZE, len(new_docs))
-        batch_docs = new_docs[batch_start:end]
+        batch_docs = new_embed_docs[batch_start:end]
         embs = model.encode(
             batch_docs,
             batch_size=EMBED_BATCH_SIZE,
@@ -509,7 +628,17 @@ def index_single_file(filepath: str | Path) -> None:
         fpath.parts[0] if fpath.parts else "unknown",
     )
 
-    docs = [ch["text"] for ch in chunks]
+    context_version = _context_version()
+    docs: list[str] = []
+    embed_docs: list[str] = []
+    contextual_prefixes: list[str] = []
+    for ch in chunks:
+        embed_doc, contextual_prefix = _contextualized_doc(
+            fpath, ch, language, repo_name
+        )
+        docs.append(ch["text"])
+        embed_docs.append(embed_doc)
+        contextual_prefixes.append(contextual_prefix)
     ids = [f"{file_str}::chunk_{i}" for i in range(len(chunks))]
     metas = [
         {
@@ -521,11 +650,13 @@ def index_single_file(filepath: str | Path) -> None:
             "end_line": ch["end_line"],
             "symbol": ch.get("symbol") or "",
             "hash": fhash,
+            "contextual_version": context_version,
+            "contextual_prefix": contextual_prefix,
         }
-        for ch in chunks
+        for ch, contextual_prefix in zip(chunks, contextual_prefixes)
     ]
 
-    embs = model.encode(docs, normalize_embeddings=True, show_progress_bar=False)
+    embs = model.encode(embed_docs, normalize_embeddings=True, show_progress_bar=False)
     store.add(ids, docs, embs, metas)
     store.save()
     _update_symbol_graph_for_file(fpath)

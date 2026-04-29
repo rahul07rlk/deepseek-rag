@@ -192,8 +192,8 @@ DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "100000
 # When disabled: temperature works normally; FIM completion is available.
 DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "enabled")
 
-# Reasoning effort when thinking is enabled: "high" (default) or "max".
-DEEPSEEK_REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "high")
+# Reasoning effort when thinking is enabled: "high" or "max".
+DEEPSEEK_REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "max")
 
 DEEPSEEK_TIMEOUT = 180
 
@@ -310,7 +310,7 @@ HYDE_TIMEOUT = float(os.getenv("HYDE_TIMEOUT", "20"))
 # Generate N rule-based query variants (rewrites that emphasize different
 # facets) and RRF-fuse the retrieval results. Rule-based, so no LLM cost.
 # Disabled by default since HyDE already covers most of the lift.
-MULTI_QUERY_ENABLED = os.getenv("MULTI_QUERY_ENABLED", "false").lower() == "true"
+MULTI_QUERY_ENABLED = os.getenv("MULTI_QUERY_ENABLED", "true").lower() == "true"
 MULTI_QUERY_VARIANTS = int(os.getenv("MULTI_QUERY_VARIANTS", "3"))
 
 # ── CRAG-style adaptive rerank floor ─────────────────────────────────────────

@@ -87,3 +87,47 @@ def test_single_file_noise_filter_removes_stale_chunks(workspace_tmp: Path, monk
     assert events == ["graph", "bm25"]
     reloaded = VectorStore(workspace_tmp / "index", dim=2, embed_model="test-model")
     assert reloaded.count() == 0
+
+
+def test_single_file_contextualizes_embedding_but_stores_raw(
+    workspace_tmp: Path, monkeypatch
+):
+    fpath = workspace_tmp / "sample.py"
+    fpath.write_text(
+        "def answer():\n    return 42\n",
+        encoding="utf-8",
+    )
+    store = VectorStore(workspace_tmp / "index", dim=2, embed_model="test-model")
+    events: list[str] = []
+
+    class FakeModel:
+        seen_docs: list[str] = []
+
+        def encode(self, docs, **_kwargs):
+            self.seen_docs = list(docs)
+            return np.asarray([[1.0, 0.0] for _ in docs], dtype=np.float32)
+
+    fake_model = FakeModel()
+
+    monkeypatch.setattr(indexer, "get_store", lambda: store)
+    monkeypatch.setattr(indexer, "get_model", lambda: fake_model)
+    monkeypatch.setattr(indexer, "schedule_bm25_rebuild", lambda: events.append("bm25"))
+    monkeypatch.setattr(
+        indexer, "_update_symbol_graph_for_file", lambda _: events.append("graph")
+    )
+    monkeypatch.setattr(indexer, "CONTEXTUAL_RETRIEVAL_MODE", "rules")
+    monkeypatch.setattr(indexer, "CONTEXTUAL_PREFIX_MAX_CHARS", 300)
+
+    indexer.index_single_file(fpath)
+
+    assert fake_model.seen_docs
+    assert fake_model.seen_docs[0].startswith("This chunk is from")
+    assert "def answer()" in fake_model.seen_docs[0]
+
+    stored = store.get_by_str_ids([f"{fpath}::chunk_0"])[f"{fpath}::chunk_0"]
+    raw_doc, meta = stored
+    assert raw_doc.startswith("def answer()")
+    assert "This chunk is from" not in raw_doc
+    assert meta["contextual_version"].startswith("rules:")
+    assert meta["contextual_prefix"].startswith("This chunk is from")
+    assert events == ["graph", "bm25"]
