@@ -16,10 +16,21 @@ Schema (kept deliberately minimal — 3 tables, no joins on the hot path):
   references(symbol, file, line, repo)
   imports(file, target, alias, line, repo)
 
-Population is best-effort: the extractor uses tree-sitter when available
-and falls back to regex for languages it doesn't parse. The agentic tools
-are robust to missing data — graph lookups that return nothing trigger a
-fallback to grep/retrieve at the tool layer.
+Population is best-effort:
+  - **Definitions / imports** use language-specific regex (cheap, reliable
+    for the small surface of `def`/`function`/`class`/`interface`/`import`
+    keywords).
+  - **References** use the tree-sitter AST extractor in
+    ``tree_sitter_chunker``. Only meaningful identifier nodes are recorded;
+    comments and string literals are naturally excluded because tree-sitter
+    doesn't emit identifier child nodes inside them. For languages
+    tree-sitter doesn't cover (or on parse failure), refs are skipped
+    entirely — we'd rather have no refs than the noise the legacy regex
+    produced (every \\w+ token across the whole file, including JSDoc,
+    log strings, error messages, …).
+
+The agentic tools are robust to missing data — graph lookups that return
+nothing trigger a fallback to grep/retrieve at the tool layer.
 """
 from __future__ import annotations
 
@@ -43,11 +54,11 @@ logger = get_logger("symbol_graph", "indexer.log")
 
 DB_PATH = INDEX_DIR / "symbol_graph.sqlite"
 
-# ── Regex-based extractor (fallback + augmentation for tree-sitter) ──────────
-# These don't need to be perfect — false positives are filtered by the
-# definition table (we only count something as a "reference" if some other
-# file defines that symbol). The cost of a missed match is graceful: the
-# tool falls back to grep / retrieval.
+# ── Definition + import patterns (regex-based) ───────────────────────────────
+# References are NOT regex-based any more — see ``_extract_file``. These
+# patterns only cover declaration keywords (def/class/function/interface/
+# import) which are small, syntactically narrow, and stable enough that
+# tree-sitter would be overkill at the precision we need.
 _DEF_RE_BY_LANG: dict[str, list[tuple[str, re.Pattern]]] = {
     "python": [
         ("function", re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)),
@@ -193,10 +204,17 @@ def _extract_file(
 ) -> tuple[list[tuple], list[tuple], list[tuple]]:
     """Return (definitions, refs, imports) tuples ready for executemany().
 
-    Refs are extracted *bulk* — every identifier-like token in the file with
-    its line number — and filtered downstream against the definition table.
-    This is cheap (regex over text) and beats trying to do real semantic
-    resolution on a regex budget.
+    Definitions and imports use language-specific regex (cheap and reliable
+    for those constructs).
+
+    References use the **tree-sitter AST extractor** when the language is
+    supported — only meaningful identifier nodes (call/member/type/field
+    names) are captured, with comments and string literals naturally
+    excluded because tree-sitter doesn't emit identifier child nodes inside
+    them. For languages tree-sitter doesn't cover (or when parsing fails)
+    refs are skipped entirely — we'd rather have no refs than the noise the
+    legacy regex produced (every \\w+ token across the whole file, including
+    inside JSDoc, log strings, error messages, …).
     """
     lang = _LANG_BY_EXT.get(fpath.suffix)
     if lang is None:
@@ -227,17 +245,26 @@ def _extract_file(
             line = text.count("\n", 0, m.start()) + 1
             imps.append((file_str, target.strip(), line, repo))
 
-    # References — every identifier-like token. We dedupe per-(symbol, line)
-    # to avoid one ref per character in a long identifier.
-    seen: set[tuple[str, int]] = set()
-    for m in re.finditer(r"\b[A-Za-z_$][A-Za-z0-9_$]{2,}\b", text):
-        sym = m.group(0)
-        line = text.count("\n", 0, m.start()) + 1
-        key = (sym, line)
-        if key in seen:
-            continue
-        seen.add(key)
-        refs.append((sym, file_str, line, repo))
+    # References — AST-driven, comment/string-aware.
+    try:
+        from src.tree_sitter_chunker import extract_references_with_tree_sitter
+        ast_refs = extract_references_with_tree_sitter(text, fpath.suffix)
+    except Exception as e:
+        logger.debug(f"AST refs unavailable for {fpath.name}: {e}")
+        ast_refs = None
+
+    if ast_refs is not None:
+        # Filter out the binding-site identifiers — for each definition row
+        # extracted above, the def's own name on its def-line is not a
+        # "reference" (it's the declaration). Without this exclusion,
+        # find_callers would always include the file where the symbol is
+        # defined, which we then re-filter at query time anyway — but
+        # filtering here saves rows in the DB and makes graph_stats honest.
+        def_keys = {(d[0], d[3]) for d in defs}
+        for sym, line in ast_refs:
+            if (sym, line) in def_keys:
+                continue
+            refs.append((sym, file_str, line, repo))
 
     return defs, refs, imps
 

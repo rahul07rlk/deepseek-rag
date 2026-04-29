@@ -242,3 +242,120 @@ def chunk_with_tree_sitter(source: str, extension: str) -> list[dict] | None:
                 chunks.extend(_split_large(child_chunk))
 
     return chunks if chunks else None
+
+
+# ── AST-based reference extraction ────────────────────────────────────────────
+# Tree-sitter naturally splits identifier-like tokens by role:
+#   identifier               — variables, functions, args (most languages)
+#   property_identifier      — `.foo` in member access (TS/JS)
+#   type_identifier          — class/type names (TS/Java/Rust/Go)
+#   field_identifier         — struct field names (Go/Rust/C)
+#   shorthand_property_id…   — `{foo}` in object literals (TS/JS)
+# Comments and string literals are atomic — tree-sitter does NOT emit child
+# identifier nodes inside them, so identifier-set extraction implicitly
+# excludes references inside comments/strings (which is the #1 source of
+# false-positive callers in the regex extractor it replaces).
+# Extension → tree-sitter language for the references pass. Different from
+# _EXT_TO_LANG (which controls chunking — Python chunks via stdlib ast, not
+# tree-sitter). The references pass uses tree-sitter for ALL supported
+# languages including Python, since it gives us comment/string-aware extraction.
+_REF_EXT_TO_LANG: dict[str, str] = {
+    **_EXT_TO_LANG,  # TS/JS/Go/Rust/Java/C/C++/C#/PHP/Ruby/Swift/Kotlin
+    ".py": "python",
+}
+
+_REF_KINDS_BY_LANG: dict[str, tuple[str, ...]] = {
+    "typescript": (
+        "identifier", "property_identifier", "type_identifier",
+        "shorthand_property_identifier",
+    ),
+    "tsx": (
+        "identifier", "property_identifier", "type_identifier",
+        "shorthand_property_identifier",
+    ),
+    "javascript": (
+        "identifier", "property_identifier",
+        "shorthand_property_identifier",
+    ),
+    "python": ("identifier",),
+    "go": ("identifier", "field_identifier", "type_identifier"),
+    "rust": ("identifier", "field_identifier", "type_identifier"),
+    "java": ("identifier", "type_identifier"),
+    "c": ("identifier", "field_identifier", "type_identifier"),
+    "cpp": ("identifier", "field_identifier", "type_identifier"),
+    "csharp": ("identifier",),
+    "ruby": ("identifier", "constant"),
+    "php": ("name",),
+    "swift": ("simple_identifier",),
+    "kotlin": ("simple_identifier",),
+}
+
+# Tokens that are syntactically identifiers but semantically noise. Keeps the
+# refs table from being spammed by language built-ins on every line.
+_REF_STOPWORDS = frozenset({
+    "self", "this", "super", "cls", "None", "True", "False", "null",
+    "true", "false", "undefined", "void", "nil", "new", "delete",
+})
+
+# Minimum identifier length. Single-char vars (i, j, x, y, n, e, f) are too
+# common to be useful for caller lookups; 2-char names like ``id``, ``db``,
+# ``os``, ``vm``, ``rx`` ARE distinctive enough so we keep them.
+_REF_MIN_LEN = 2
+
+
+def extract_references_with_tree_sitter(
+    source: str,
+    extension: str,
+) -> list[tuple[str, int]] | None:
+    """Return ``[(symbol, line_1_indexed), ...]`` of every meaningful identifier
+    reference in ``source``. None on any failure (caller falls back).
+
+    "Meaningful" excludes:
+      - tokens inside comments / string literals (tree-sitter doesn't emit
+        identifier nodes inside those — implicit filtering)
+      - reserved words / built-ins (parsed as keywords, not identifiers)
+      - tokens shorter than ``_REF_MIN_LEN``
+      - language built-ins like ``self``, ``this``, ``super`` (semantic noise)
+
+    The caller (symbol_graph) further filters references against the
+    definition table to surface true cross-file callers.
+    """
+    if not _AVAILABLE:
+        return None
+    lang = _REF_EXT_TO_LANG.get(extension)
+    if lang is None:
+        return None
+    ref_kinds = _REF_KINDS_BY_LANG.get(lang)
+    if not ref_kinds:
+        return None
+    try:
+        source_bytes = source.encode("utf-8")
+        tree = _ts.parse_string(lang, source_bytes)
+    except Exception:
+        return None
+
+    seen: set[tuple[str, int]] = set()
+    out: list[tuple[str, int]] = []
+    for kind in ref_kinds:
+        try:
+            nodes = _ts.find_nodes_by_type(tree, kind)
+        except Exception:
+            continue
+        for node in nodes:
+            try:
+                text = source_bytes[node.start_byte : node.end_byte].decode(
+                    "utf-8", errors="ignore"
+                )
+            except Exception:
+                continue
+            if len(text) < _REF_MIN_LEN:
+                continue
+            if text in _REF_STOPWORDS:
+                continue
+            line = node.start_row + 1  # 0-indexed → 1-indexed
+            key = (text, line)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(key)
+    return out

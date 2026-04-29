@@ -142,9 +142,17 @@ WHOLE_FILE_MAX_CHARS = int(os.getenv("WHOLE_FILE_MAX_CHARS", "80000"))
 #   - boost candidates whose stored symbol exactly matches a query identifier
 #   - boost candidates whose file path matches a query path mention
 QUERY_ANALYSIS_ENABLED = os.getenv("QUERY_ANALYSIS_ENABLED", "true").lower() == "true"
-# Additive RRF score boosts (typical RRF scores are 0.01–0.10, so 0.05 is large).
-SYMBOL_BOOST = float(os.getenv("SYMBOL_BOOST", "0.05"))
-PATH_BOOST = float(os.getenv("PATH_BOOST", "0.03"))
+# Multiplicative RRF score boosts. The score is rescaled as
+#     score' = score * (1 + sym_boost * sym_match) * (1 + path_boost * path_match)
+# so a SYMBOL_BOOST of 1.0 means "double the fused score on an exact-symbol
+# match" and PATH_BOOST 0.5 means "+50% on a path-match". This is *scale-
+# invariant* — a low-score hit and a high-score hit get the same proportional
+# lift, unlike the legacy additive scheme where 0.05 was a 500% boost on a
+# 0.01 score and a 50% boost on a 0.1 score (calibration by feel).
+# Defaults are tuned to be roughly equivalent to the historical additive
+# behavior in the median RRF score regime; tune via the eval harness.
+SYMBOL_BOOST = float(os.getenv("SYMBOL_BOOST", "1.0"))
+PATH_BOOST = float(os.getenv("PATH_BOOST", "0.5"))
 # LRU cache for query embeddings — same query repeated (e.g. follow-up turn)
 # skips the embedder entirely.
 QUERY_EMBED_CACHE_SIZE = int(os.getenv("QUERY_EMBED_CACHE_SIZE", "256"))

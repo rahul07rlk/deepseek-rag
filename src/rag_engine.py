@@ -252,8 +252,18 @@ def _apply_query_boosts(
     by_id: dict[str, tuple[str, dict]],
     analysis: QueryAnalysis,
 ) -> list[tuple[str, float]]:
-    """Add additive boosts to fused scores for chunks whose stored symbol
+    """Multiplicatively boost fused scores for chunks whose stored symbol
     or file path matches identifiers/paths extracted from the query.
+
+    Formula:
+        score' = score * (1 + SYMBOL_BOOST if symbol_match else 1)
+                       * (1 + PATH_BOOST   if path_match   else 1)
+
+    Scale-invariant: a chunk at fused rank 80 with a 0.012 score and an
+    exact symbol match scales to 0.024 (still small but doubled), the same
+    *proportional* lift a top-ranked 0.08 chunk gets when boosted to 0.16.
+    The legacy additive scheme had a 0.05 add-on equal to a 500% boost in
+    the first regime and only 60% in the second — calibration by feel.
 
     A clean exact-symbol query like ``resolveHandle`` should never miss its
     target chunk just because the embedder ranked something else higher.
@@ -263,25 +273,29 @@ def _apply_query_boosts(
     sym_lower = {s.lower() for s in analysis.symbols}
     path_lower = [p.lower().replace("\\", "/") for p in analysis.paths]
     boosted: dict[str, float] = dict(fused)
-    for doc_id, _score in fused:
+    for doc_id, score in fused:
         if doc_id not in by_id:
             continue
         _, meta = by_id[doc_id]
+        sym_factor = 1.0
+        path_factor = 1.0
         # Symbol boost: exact case-insensitive match against any query symbol.
         # Stored symbols look like "ClassName.methodName" or "func_name".
         meta_symbol = (meta.get("symbol") or "").lower()
         if meta_symbol and sym_lower:
             symbol_parts = {meta_symbol, *meta_symbol.split("."), *meta_symbol.split()}
             if symbol_parts & sym_lower:
-                boosted[doc_id] = boosted.get(doc_id, 0.0) + SYMBOL_BOOST
+                sym_factor = 1.0 + SYMBOL_BOOST
         # Path boost: query mentioned a filename or partial path that occurs
         # in the chunk's file path.
         meta_file = (meta.get("file") or "").lower().replace("\\", "/")
         if meta_file and path_lower:
             for p in path_lower:
                 if p in meta_file:
-                    boosted[doc_id] = boosted.get(doc_id, 0.0) + PATH_BOOST
+                    path_factor = 1.0 + PATH_BOOST
                     break
+        if sym_factor != 1.0 or path_factor != 1.0:
+            boosted[doc_id] = score * sym_factor * path_factor
     return sorted(boosted.items(), key=lambda x: x[1], reverse=True)
 
 
@@ -471,11 +485,19 @@ def _expand_ranked_with_call_graph(
     return ranked + additions
 
 
-_VAGUE_FOLLOWUP_MARKERS = (
-    "fix it", "still wrong", "wrong", "same issue", "that issue",
-    "this issue", "try again", "continue", "do it", "not working",
-    "it fails", "still fails", "what about that", "above",
+# Demonstrative + reference pronouns. A short query containing any of these
+# is almost certainly referring to something in the prior turn. This replaces
+# a 14-phrase English-only marker list ("fix it", "still wrong", "what about
+# that", "above", …) which was both brittle (missed "and now make it work")
+# and redundant (every phrase contained one of these pronouns anyway).
+_PRONOUN_RE = re.compile(
+    r"\b(it|this|that|these|those|them|they|their|its|above|previous|same|here)\b",
+    re.IGNORECASE,
 )
+
+
+def _has_pronoun(q: str) -> bool:
+    return bool(_PRONOUN_RE.search(q))
 
 
 def _history_excerpt_for_retrieval(conversation_history: list[dict] | None) -> str:
@@ -522,11 +544,11 @@ def _conversation_aware_query(
     if not CONVERSATION_AWARE_RETRIEVAL:
         return query, False
     q = (query or "").strip()
-    lower = q.lower()
-    is_vague = (
-        len(q) <= CONVERSATION_VAGUE_QUERY_CHARS
-        or any(marker in lower for marker in _VAGUE_FOLLOWUP_MARKERS)
-    )
+    # A query is vague when it's BOTH short AND uses a referential pronoun.
+    # Either signal alone is too noisy: short queries can be precise
+    # ("fix indexer.py:401"), and long queries with pronouns are usually
+    # self-contained ("explain how this module's caching works").
+    is_vague = len(q) <= CONVERSATION_VAGUE_QUERY_CHARS and _has_pronoun(q)
     if not is_vague:
         return query, False
     excerpt = _history_excerpt_for_retrieval(conversation_history)
