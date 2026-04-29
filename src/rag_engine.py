@@ -37,13 +37,18 @@ from src.config import (
     BM25_CACHE,
     CANDIDATE_POOL,
     HYBRID_ALPHA,
+    LOW_CONFIDENCE_THRESHOLD,
     MIN_RELEVANCE_SCORE,
     MIN_RERANK_SCORE,
+    MULTI_QUERY_ENABLED,
+    MULTI_QUERY_VARIANTS,
     NEIGHBOR_EXPANSION,
     NEIGHBOR_PAD_LINES,
     PATH_BOOST,
     QUERY_ANALYSIS_ENABLED,
     QUERY_EMBED_CACHE_SIZE,
+    RERANK_RELATIVE_FLOOR,
+    REPO_MAP_ENABLED,
     RERANKER_BATCH_SIZE,
     RERANKER_ENABLED,
     RERANKER_TOP_N,
@@ -128,6 +133,54 @@ def _vector_search(query: str, n: int) -> list[tuple[str, float]]:
     store = get_store()
     emb = np.frombuffer(_embed_query(query), dtype=np.float32)
     return store.search(emb, n)
+
+
+def _multi_query_recall(
+    queries: list[str], n: int
+) -> tuple[list[tuple[str, float]], dict[str, float]]:
+    """Run vector + BM25 against each query variant and RRF-fuse the results.
+
+    Returns ``(fused_vector_hits, vec_sim_lookup)`` where:
+      - ``fused_vector_hits`` = a single ranked list of doc_ids derived from
+        merging each variant's vector hits via RRF — used downstream as if
+        a single vector query produced it.
+      - ``vec_sim_lookup`` = best raw vector similarity any variant achieved
+        for a given doc_id (used as the "Relevance" score when reranker is off).
+
+    Variant 0 is always the original query, so single-query callers degrade
+    to plain ``_vector_search`` semantics when only one variant is given.
+    """
+    if not queries:
+        return [], {}
+    if len(queries) == 1:
+        hits = _vector_search(queries[0], n)
+        return hits, dict(hits)
+
+    rrf_k = 60
+    fused: dict[str, float] = {}
+    sim_lookup: dict[str, float] = {}
+    for q in queries:
+        hits = _vector_search(q, n)
+        for rank, (doc_id, sim) in enumerate(hits):
+            fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+            if sim > sim_lookup.get(doc_id, -1.0):
+                sim_lookup[doc_id] = sim
+    ranked = sorted(fused.items(), key=lambda x: x[1], reverse=True)[:n]
+    return ranked, sim_lookup
+
+
+def _multi_query_bm25(queries: list[str], n: int) -> list[tuple[str, float]]:
+    """Same idea for BM25 — RRF over each variant's keyword hits."""
+    if not queries:
+        return []
+    if len(queries) == 1:
+        return _bm25_search(queries[0], n)
+    rrf_k = 60
+    fused: dict[str, float] = {}
+    for q in queries:
+        for rank, (doc_id, _) in enumerate(_bm25_search(q, n)):
+            fused[doc_id] = fused.get(doc_id, 0.0) + 1.0 / (rrf_k + rank)
+    return sorted(fused.items(), key=lambda x: x[1], reverse=True)[:n]
 
 
 # ── BM25 search ───────────────────────────────────────────────────────────────
@@ -219,13 +272,25 @@ def _apply_query_boosts(
 def _rerank_candidates(
     query: str,
     materialized: list[tuple[str, float, str, dict]],
-) -> list[tuple[str, float, float, str, dict]] | None:
+) -> tuple[list[tuple[str, float, float, str, dict]], float] | None:
     """Score (query, doc) pairs jointly with the cross-encoder.
 
-    Returns [(str_id, rerank_score, fused_score, doc, meta), ...] sorted by
-    rerank_score desc, truncated to RERANKER_TOP_N and floored by
-    MIN_RERANK_SCORE. Returns None if reranker unavailable so the caller
-    can fall back to the fusion-only path.
+    Returns ``(scored, top_score)`` where ``scored`` is
+    ``[(str_id, rerank_score, fused_score, doc, meta), ...]`` sorted by
+    rerank_score desc, truncated to RERANKER_TOP_N, and filtered by an
+    *adaptive* CRAG-style floor:
+
+        floor = max(MIN_RERANK_SCORE, top_score * RERANK_RELATIVE_FLOOR)
+
+    The relative floor is the key fix — when the top hit scores 0.9, we
+    safely cut anything below 0.36 (clear signal). When the top is 0.2
+    (low confidence), we keep everything because the LLM may still need
+    to see the candidates to figure out the codebase doesn't contain
+    what was asked. ``top_score`` is returned so the seed builder can
+    inject a "low confidence" hint into the prompt.
+
+    Returns None if the reranker is unavailable so the caller can fall
+    back to the fusion-only path.
     """
     reranker = get_reranker()
     if reranker is None or not materialized:
@@ -236,17 +301,32 @@ def _rerank_candidates(
         batch_size=RERANKER_BATCH_SIZE,
         show_progress_bar=False,
     )
+    # Sanitize before sigmoid — some cross-encoder checkpoints emit NaN/Inf
+    # for degenerate inputs (empty doc, all-padding batch). nan→0 (neutral),
+    # posinf→10/neginf→-10 (clamped to ~1.0/~0.0 after sigmoid).
+    raw = np.nan_to_num(
+        np.asarray(raw, dtype=np.float64),
+        nan=0.0,
+        posinf=10.0,
+        neginf=-10.0,
+    )
     # Both backends return raw logits / log-odds; sigmoid normalizes to [0, 1]
     # so MIN_RERANK_SCORE and the per-block "Relevance:" header are calibrated.
-    norm = 1.0 / (1.0 + np.exp(-np.asarray(raw, dtype=np.float64)))
+    norm = 1.0 / (1.0 + np.exp(-raw))
+    if norm.size == 0:
+        return [], 0.0
+    top_score = float(np.max(norm))
+    # Adaptive floor: only kicks in when there's a clear top — protects
+    # weak-signal cases from getting nuked.
+    adaptive_floor = max(MIN_RERANK_SCORE, top_score * RERANK_RELATIVE_FLOOR)
     scored: list[tuple[str, float, float, str, dict]] = []
     for i, (doc_id, fused_score, doc, meta) in enumerate(materialized):
         s = float(norm[i])
-        if s < MIN_RERANK_SCORE:
+        if s < adaptive_floor:
             continue
         scored.append((doc_id, s, fused_score, doc, meta))
     scored.sort(key=lambda x: x[1], reverse=True)
-    return scored[:RERANKER_TOP_N]
+    return scored[:RERANKER_TOP_N], top_score
 
 
 def _merge_ranges(
@@ -274,15 +354,30 @@ def retrieve(
     query: str,
     top_k: int = TOP_K_CHUNKS,
     alpha: float = HYBRID_ALPHA,
+    token_budget: int = TOKEN_BUDGET,
+    vector_query_override: str | None = None,
+    use_multi_query: bool | None = None,
 ) -> tuple[str, int, list[dict]]:
-    """Return (context_string, token_count, list_of_used_block_metas).
+    """Return ``(context_string, token_count, list_of_used_block_metas)``.
 
     A "block" is one of:
       - a whole file (when ≥ WHOLE_FILE_THRESHOLD chunks land in it)
       - a neighbor-expanded line range read from disk
       - a raw chunk (fallback when expansion is disabled or disk read fails)
 
-    `top_k` caps the number of blocks, not raw chunks.
+    Args:
+        query: the user's original query — always used for BM25 and for
+            symbol/path boost targets so exact-symbol matches still work.
+        vector_query_override: when set (e.g. by HyDE), this is used as the
+            *vector* query while ``query`` keeps driving BM25. Asymmetry by
+            design — HyDE expands prose into code-shaped tokens that the
+            embedder loves but BM25 doesn't.
+        use_multi_query: when True (or default-on via MULTI_QUERY_ENABLED),
+            generate rule-based query variants and RRF-fuse their hits.
+
+    The last ``meta`` in the return list carries an extra ``"confidence"``
+    field (top rerank score 0..1) that the seed builder can use to flag
+    low-signal retrievals for the LLM.
     """
     # ── Stage 1: query analysis (adaptive alpha + boost targets). ─────────────
     if QUERY_ANALYSIS_ENABLED:
@@ -292,9 +387,23 @@ def retrieve(
         analysis = QueryAnalysis(raw_query=query, alpha=alpha)
         effective_alpha = alpha
 
-    vec_hits = _vector_search(query, CANDIDATE_POOL)
-    bm_hits = _bm25_search(query, CANDIDATE_POOL)
-    vec_sim: dict[str, float] = dict(vec_hits)
+    # ── Stage 1.25: query expansion. ──────────────────────────────────────────
+    # The vector side is allowed to swap out the query (HyDE). The BM25 side
+    # always uses the original — keyword vocabulary should match what the
+    # user actually typed, not a paraphrase.
+    vector_query = vector_query_override or query
+    do_multi = MULTI_QUERY_ENABLED if use_multi_query is None else use_multi_query
+    if do_multi:
+        from src.multi_query import expand as expand_queries
+
+        vector_variants = expand_queries(vector_query, analysis, MULTI_QUERY_VARIANTS)
+        bm25_variants = expand_queries(query, analysis, MULTI_QUERY_VARIANTS)
+    else:
+        vector_variants = [vector_query]
+        bm25_variants = [query]
+
+    vec_hits, vec_sim = _multi_query_recall(vector_variants, CANDIDATE_POOL)
+    bm_hits = _multi_query_bm25(bm25_variants, CANDIDATE_POOL)
 
     fused = _rrf_fuse(vec_hits, bm_hits, alpha=effective_alpha)
     if not fused:
@@ -330,10 +439,11 @@ def retrieve(
     # With reranker off: primary = vec_sim,                 secondary = fused
     rerank_mode = "off"
     ranked: list[tuple[str, float, float, str, dict]] = []
+    confidence: float = 0.0
     if RERANKER_ENABLED:
         reranked = _rerank_candidates(query, materialized)
         if reranked is not None:
-            ranked = reranked
+            ranked, confidence = reranked
             rerank_mode = "on"
 
     if rerank_mode == "off":
@@ -342,6 +452,9 @@ def retrieve(
             if relevance < MIN_RELEVANCE_SCORE:
                 continue
             ranked.append((doc_id, relevance, fused_score, doc, meta))
+        # Use top vec_sim as confidence proxy when reranker is off.
+        if ranked:
+            confidence = max(r[1] for r in ranked)
 
     if not ranked:
         logger.warning("All candidates filtered out (reranker=%s).", rerank_mode)
@@ -365,7 +478,7 @@ def retrieve(
     blocks_emitted = 0
 
     for f in file_order:
-        if blocks_emitted >= top_k or total_tokens >= TOKEN_BUDGET:
+        if blocks_emitted >= top_k or total_tokens >= token_budget:
             break
 
         hits = file_hits[f]
@@ -394,11 +507,9 @@ def retrieve(
                     f" | **Fused:** {top_score:.3f}"
                     f" | **Mode:** whole-file ({len(hits)} hits)"
                 )
-                # Count tokens on the FORMATTED block (header + body) so the
-                # budget tracker matches what's actually injected into the prompt.
                 formatted = _format_block(meta, full_text, header_extra)
                 tokens = count_tokens(formatted)
-                if total_tokens + tokens > TOKEN_BUDGET:
+                if total_tokens + tokens > token_budget:
                     break
                 context_parts.append(formatted)
                 used_metas.append({
@@ -416,7 +527,6 @@ def retrieve(
 
         # ── Tier 2: neighbor-expanded ranges ──────────────────────────────────
         if NEIGHBOR_EXPANSION and lines is not None:
-            # Map each retrieved chunk's line range, keeping its best fused score.
             ranges_with_score: dict[tuple[int, int], float] = {}
             for fused_score, _rel, _doc, meta in hits:
                 key = (meta["start_line"], meta["end_line"])
@@ -428,7 +538,7 @@ def retrieve(
                 max_line=len(lines),
             )
             for s, e in merged:
-                if blocks_emitted >= top_k or total_tokens >= TOKEN_BUDGET:
+                if blocks_emitted >= top_k or total_tokens >= token_budget:
                     break
                 body = "".join(lines[s - 1 : e]).rstrip()
                 if not body:
@@ -446,7 +556,7 @@ def retrieve(
                 )
                 formatted = _format_block(meta, body, header_extra)
                 tokens = count_tokens(formatted)
-                if total_tokens + tokens > TOKEN_BUDGET:
+                if total_tokens + tokens > token_budget:
                     break
                 context_parts.append(formatted)
                 used_metas.append({
@@ -462,7 +572,7 @@ def retrieve(
 
         # ── Tier 3: raw chunks (fallback) ─────────────────────────────────────
         for fused_score, relevance, doc, meta in hits:
-            if blocks_emitted >= top_k or total_tokens >= TOKEN_BUDGET:
+            if blocks_emitted >= top_k or total_tokens >= token_budget:
                 break
             header_extra = (
                 f" | **Relevance:** {relevance:.2f}"
@@ -470,7 +580,7 @@ def retrieve(
             )
             formatted = _format_block(meta, doc, header_extra)
             tokens = count_tokens(formatted)
-            if total_tokens + tokens > TOKEN_BUDGET:
+            if total_tokens + tokens > token_budget:
                 break
             context_parts.append(formatted)
             used_metas.append({
@@ -491,25 +601,64 @@ def retrieve(
     for m in used_metas:
         mode_counts[m["mode"]] = mode_counts.get(m["mode"], 0) + 1
     note_suffix = f" ({analysis.note})" if analysis.note else ""
+    is_low_conf = confidence > 0 and confidence < LOW_CONFIDENCE_THRESHOLD
+    conf_tag = f" | conf={confidence:.2f}{' LOW' if is_low_conf else ''}"
+    expansions = []
+    if vector_query_override and vector_query_override != query:
+        expansions.append("hyde")
+    if do_multi:
+        expansions.append(f"multi-query×{len(vector_variants)}")
+    expansion_tag = f" | expand={','.join(expansions)}" if expansions else ""
     logger.info(
         f"Retrieved {len(used_metas)} blocks ({mode_counts}) | "
-        f"reranker={rerank_mode} | alpha={effective_alpha:.2f}{note_suffix} | "
+        f"reranker={rerank_mode} | alpha={effective_alpha:.2f}{note_suffix}"
+        f"{conf_tag}{expansion_tag} | "
         f"~{actual_tokens} tokens | Files: {files_cited}"
     )
+    # Attach confidence to every emitted meta — callers (seed builder,
+    # agentic loop) can read it without recomputing.
+    for m in used_metas:
+        m["confidence"] = confidence
+        m["low_confidence"] = is_low_conf
     return context_str, actual_tokens, used_metas
 
 
 def build_messages(
     user_query: str,
     conversation_history: list[dict] | None = None,
+    token_budget: int | None = None,
 ) -> list[dict]:
-    context_str, token_count, metas = retrieve(user_query)
+    """Build the chat-completion message list for one-shot retrieval.
+
+    The agentic proxy uses ``build_seed_messages`` instead — keeping this
+    around lets us fall back cleanly when AGENTIC_ENABLED=false or the
+    DeepSeek tool-use loop fails.
+    """
+    context_str, token_count, metas = retrieve(
+        user_query, token_budget=token_budget or TOKEN_BUDGET
+    )
 
     files_cited = sorted({m["file"] for m in metas})
     files_summary = "\n".join(f"  - {f}" for f in files_cited) or "  (none)"
 
-    system_message = f"""You are an expert software engineer with full semantic access to the codebase.
+    repo_map_block = ""
+    if REPO_MAP_ENABLED:
+        try:
+            from src.repo_map import relevant_repo_map
+            rmap, _ = relevant_repo_map(user_query)
+            if rmap:
+                repo_map_block = (
+                    "\n## Repository Map (most relevant files first)\n"
+                    "Use this to orient yourself in the codebase before reading "
+                    "the code excerpts below. Each entry shows path, language, "
+                    "size, and the names of its top-level definitions.\n\n"
+                    f"{rmap}\n"
+                )
+        except Exception as e:
+            logger.warning(f"Repo-map injection skipped: {e}")
 
+    system_message = f"""You are an expert software engineer with full semantic access to the codebase.
+{repo_map_block}
 ## Retrieved Codebase Context
 The following code was retrieved as the most relevant to the current query
 via hybrid BM25 + vector search, then expanded with neighboring lines and

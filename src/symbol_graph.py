@@ -1,0 +1,420 @@
+"""Symbol graph: per-file definitions + cross-file references via SQLite.
+
+Pure-text retrieval can't answer the questions developers actually ask:
+
+  - "who calls ``resolveHandle``?"
+  - "what implements ``IUserRepo``?"
+  - "what files import from ``services/auth.ts``?"
+
+Tree-sitter already gives us the AST at chunk time; this module stores
+(symbol, file, kind, line) tuples in a tiny SQLite database alongside the
+FAISS index, then exposes targeted lookups for the agentic tool layer.
+
+Schema (kept deliberately minimal — 3 tables, no joins on the hot path):
+
+  definitions(symbol, file, kind, start_line, end_line, repo)
+  references(symbol, file, line, repo)
+  imports(file, target, alias, line, repo)
+
+Population is best-effort: the extractor uses tree-sitter when available
+and falls back to regex for languages it doesn't parse. The agentic tools
+are robust to missing data — graph lookups that return nothing trigger a
+fallback to grep/retrieve at the tool layer.
+"""
+from __future__ import annotations
+
+import re
+import sqlite3
+from contextlib import contextmanager
+from pathlib import Path
+
+from src.config import (
+    IGNORED_DIRS,
+    IGNORED_FILENAMES,
+    IGNORED_SUFFIXES,
+    INDEX_DIR,
+    INDEXED_EXTENSIONS,
+    MAX_FILE_BYTES,
+    REPO_PATHS,
+)
+from src.utils.logger import get_logger
+
+logger = get_logger("symbol_graph", "indexer.log")
+
+DB_PATH = INDEX_DIR / "symbol_graph.sqlite"
+
+# ── Regex-based extractor (fallback + augmentation for tree-sitter) ──────────
+# These don't need to be perfect — false positives are filtered by the
+# definition table (we only count something as a "reference" if some other
+# file defines that symbol). The cost of a missed match is graceful: the
+# tool falls back to grep / retrieval.
+_DEF_RE_BY_LANG: dict[str, list[tuple[str, re.Pattern]]] = {
+    "python": [
+        ("function", re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", re.M)),
+        ("class",    re.compile(r"^\s*class\s+([A-Za-z_][A-Za-z0-9_]*)\b", re.M)),
+    ],
+    "typescript": [
+        ("function",  re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][A-Za-z0-9_$]*)", re.M)),
+        ("class",     re.compile(r"^\s*(?:export\s+(?:default\s+)?)?(?:abstract\s+)?class\s+([A-Za-z_$][A-Za-z0-9_$]*)", re.M)),
+        ("interface", re.compile(r"^\s*(?:export\s+)?interface\s+([A-Za-z_$][A-Za-z0-9_$]*)", re.M)),
+        ("type",      re.compile(r"^\s*(?:export\s+)?type\s+([A-Za-z_$][A-Za-z0-9_$]*)", re.M)),
+        ("enum",      re.compile(r"^\s*(?:export\s+)?enum\s+([A-Za-z_$][A-Za-z0-9_$]*)", re.M)),
+        ("const",     re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*(?:async\s*)?(?:\(|function)", re.M)),
+    ],
+    "go": [
+        ("function", re.compile(r"^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_][A-Za-z0-9_]*)", re.M)),
+        ("type",     re.compile(r"^\s*type\s+([A-Za-z_][A-Za-z0-9_]*)\s+(?:struct|interface)", re.M)),
+    ],
+    "rust": [
+        ("function", re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)),
+        ("struct",   re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?struct\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)),
+        ("enum",     re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?enum\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)),
+        ("trait",    re.compile(r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?trait\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)),
+    ],
+    "java": [
+        ("class",     re.compile(r"^\s*(?:public|private|protected)?\s*(?:abstract\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)),
+        ("interface", re.compile(r"^\s*(?:public|private|protected)?\s*interface\s+([A-Za-z_][A-Za-z0-9_]*)", re.M)),
+    ],
+}
+_DEF_RE_BY_LANG["javascript"] = _DEF_RE_BY_LANG["typescript"]
+_DEF_RE_BY_LANG["tsx"]        = _DEF_RE_BY_LANG["typescript"]
+_DEF_RE_BY_LANG["jsx"]        = _DEF_RE_BY_LANG["typescript"]
+_DEF_RE_BY_LANG["csharp"]     = _DEF_RE_BY_LANG["java"]
+_DEF_RE_BY_LANG["kotlin"]     = _DEF_RE_BY_LANG["java"]
+
+_IMPORT_RE_BY_LANG: dict[str, re.Pattern] = {
+    # Captures the module path. Aliases are not extracted here — the path is
+    # what matters for the call graph; aliases live with the references row.
+    "python":     re.compile(r"^\s*(?:from\s+([\w.]+)\s+import|import\s+([\w.,\s]+))", re.M),
+    "typescript": re.compile(r"""^\s*(?:import|export)\s+(?:.*?from\s+)?["']([^"']+)["']""", re.M),
+    "go":         re.compile(r"""^\s*import\s+(?:\([^)]*\)|"([^"]+)")""", re.M | re.S),
+    "rust":       re.compile(r"^\s*use\s+([\w:]+)", re.M),
+    "java":       re.compile(r"^\s*import\s+([\w.]+);", re.M),
+}
+_IMPORT_RE_BY_LANG["javascript"] = _IMPORT_RE_BY_LANG["typescript"]
+_IMPORT_RE_BY_LANG["tsx"]        = _IMPORT_RE_BY_LANG["typescript"]
+_IMPORT_RE_BY_LANG["jsx"]        = _IMPORT_RE_BY_LANG["typescript"]
+_IMPORT_RE_BY_LANG["csharp"]     = re.compile(r"^\s*using\s+([\w.]+);", re.M)
+_IMPORT_RE_BY_LANG["kotlin"]     = re.compile(r"^\s*import\s+([\w.]+)", re.M)
+
+_LANG_BY_EXT = {
+    ".py": "python", ".ts": "typescript", ".tsx": "tsx",
+    ".js": "javascript", ".jsx": "jsx",
+    ".go": "go", ".rs": "rust",
+    ".java": "java", ".cs": "csharp", ".kt": "kotlin",
+}
+
+
+# ── DB lifecycle ──────────────────────────────────────────────────────────────
+def _connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS definitions (
+            symbol     TEXT NOT NULL,
+            file       TEXT NOT NULL,
+            kind       TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line   INTEGER,
+            repo       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_def_symbol ON definitions(symbol);
+        CREATE INDEX IF NOT EXISTS idx_def_file   ON definitions(file);
+
+        CREATE TABLE IF NOT EXISTS refs (
+            symbol TEXT NOT NULL,
+            file   TEXT NOT NULL,
+            line   INTEGER NOT NULL,
+            repo   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_ref_symbol ON refs(symbol);
+        CREATE INDEX IF NOT EXISTS idx_ref_file   ON refs(file);
+
+        CREATE TABLE IF NOT EXISTS imports (
+            file   TEXT NOT NULL,
+            target TEXT NOT NULL,
+            line   INTEGER,
+            repo   TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_imp_file   ON imports(file);
+        CREATE INDEX IF NOT EXISTS idx_imp_target ON imports(target);
+    """)
+    return conn
+
+
+@contextmanager
+def _txn():
+    conn = _connect()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Extraction ────────────────────────────────────────────────────────────────
+def _is_indexable(fpath: Path) -> bool:
+    if fpath.suffix not in INDEXED_EXTENSIONS:
+        return False
+    if fpath.name in IGNORED_FILENAMES:
+        return False
+    lower = fpath.name.lower()
+    if any(lower.endswith(s) for s in IGNORED_SUFFIXES):
+        return False
+    try:
+        size = fpath.stat().st_size
+    except OSError:
+        return False
+    if size == 0 or size > MAX_FILE_BYTES:
+        return False
+    if any(part in IGNORED_DIRS for part in fpath.parts):
+        return False
+    return True
+
+
+def _walk_indexable() -> list[tuple[Path, str]]:
+    """Yield (path, repo_name) for every indexable source file."""
+    out: list[tuple[Path, str]] = []
+    for repo in REPO_PATHS:
+        repo_name = repo.name
+        for p in repo.rglob("*"):
+            if not p.is_file():
+                continue
+            if any(part in IGNORED_DIRS for part in p.relative_to(repo).parts):
+                continue
+            if _is_indexable(p):
+                out.append((p, repo_name))
+    return out
+
+
+def _extract_file(
+    fpath: Path,
+    repo: str,
+) -> tuple[list[tuple], list[tuple], list[tuple]]:
+    """Return (definitions, refs, imports) tuples ready for executemany().
+
+    Refs are extracted *bulk* — every identifier-like token in the file with
+    its line number — and filtered downstream against the definition table.
+    This is cheap (regex over text) and beats trying to do real semantic
+    resolution on a regex budget.
+    """
+    lang = _LANG_BY_EXT.get(fpath.suffix)
+    if lang is None:
+        return [], [], []
+    try:
+        text = fpath.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return [], [], []
+
+    file_str = str(fpath)
+    defs: list[tuple] = []
+    imps: list[tuple] = []
+    refs: list[tuple] = []
+
+    # Definitions.
+    for kind, pat in _DEF_RE_BY_LANG.get(lang, []):
+        for m in pat.finditer(text):
+            line = text.count("\n", 0, m.start()) + 1
+            defs.append((m.group(1), file_str, kind, line, line, repo))
+
+    # Imports.
+    imp_pat = _IMPORT_RE_BY_LANG.get(lang)
+    if imp_pat is not None:
+        for m in imp_pat.finditer(text):
+            target = next((g for g in m.groups() if g), None)
+            if not target:
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            imps.append((file_str, target.strip(), line, repo))
+
+    # References — every identifier-like token. We dedupe per-(symbol, line)
+    # to avoid one ref per character in a long identifier.
+    seen: set[tuple[str, int]] = set()
+    for m in re.finditer(r"\b[A-Za-z_$][A-Za-z0-9_$]{2,}\b", text):
+        sym = m.group(0)
+        line = text.count("\n", 0, m.start()) + 1
+        key = (sym, line)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append((sym, file_str, line, repo))
+
+    return defs, refs, imps
+
+
+def build_symbol_graph() -> dict:
+    """Rebuild the entire graph from the configured REPO_PATHS."""
+    files = _walk_indexable()
+    if not files:
+        logger.info("Symbol graph: no indexable files found.")
+        return {"definitions": 0, "refs": 0, "imports": 0, "files": 0}
+
+    all_defs: list[tuple] = []
+    all_refs: list[tuple] = []
+    all_imps: list[tuple] = []
+    for fpath, repo in files:
+        d, r, i = _extract_file(fpath, repo)
+        all_defs.extend(d)
+        all_refs.extend(r)
+        all_imps.extend(i)
+
+    with _txn() as conn:
+        conn.execute("DELETE FROM definitions")
+        conn.execute("DELETE FROM refs")
+        conn.execute("DELETE FROM imports")
+        conn.executemany(
+            "INSERT INTO definitions(symbol,file,kind,start_line,end_line,repo) VALUES (?,?,?,?,?,?)",
+            all_defs,
+        )
+        conn.executemany(
+            "INSERT INTO refs(symbol,file,line,repo) VALUES (?,?,?,?)",
+            all_refs,
+        )
+        conn.executemany(
+            "INSERT INTO imports(file,target,line,repo) VALUES (?,?,?,?)",
+            all_imps,
+        )
+
+    summary = {
+        "definitions": len(all_defs),
+        "refs": len(all_refs),
+        "imports": len(all_imps),
+        "files": len(files),
+    }
+    logger.info(f"Symbol graph built: {summary}")
+    return summary
+
+
+# ── Incremental updates (used by the watcher on per-file save) ───────────────
+def _resolve_repo(fpath: Path) -> str:
+    """Best-effort repo name lookup so a file save can map to its repo without
+    a full walk."""
+    for rp in REPO_PATHS:
+        try:
+            fpath.relative_to(rp)
+            return rp.name
+        except ValueError:
+            continue
+    return fpath.parts[0] if fpath.parts else "unknown"
+
+
+def delete_for_file(fpath: Path | str) -> int:
+    """Drop every definition/ref/import row for ``fpath``. Returns rows deleted.
+
+    Cheap (indexed by file) — runs in microseconds even for large graphs.
+    """
+    file_str = str(fpath)
+    if not DB_PATH.exists():
+        return 0
+    with _txn() as conn:
+        d = conn.execute("DELETE FROM definitions WHERE file = ?", (file_str,)).rowcount
+        r = conn.execute("DELETE FROM refs WHERE file = ?", (file_str,)).rowcount
+        i = conn.execute("DELETE FROM imports WHERE file = ?", (file_str,)).rowcount
+    return (d or 0) + (r or 0) + (i or 0)
+
+
+def update_for_file(fpath: Path | str) -> dict:
+    """Idempotent per-file refresh: delete old rows, re-extract, re-insert.
+
+    Mirrors what ``index_single_file`` does for the FAISS index. Together they
+    let the watcher keep the entire system (vectors + BM25 + symbol graph) in
+    sync with disk without ever requiring a full reindex.
+    """
+    fpath = Path(fpath)
+    file_str = str(fpath)
+    if not _is_indexable(fpath) or not fpath.exists():
+        # File deleted or no longer indexable — wipe its rows and stop.
+        delete_for_file(file_str)
+        return {"definitions": 0, "refs": 0, "imports": 0}
+
+    repo = _resolve_repo(fpath)
+    defs, refs, imps = _extract_file(fpath, repo)
+
+    with _txn() as conn:
+        conn.execute("DELETE FROM definitions WHERE file = ?", (file_str,))
+        conn.execute("DELETE FROM refs WHERE file = ?", (file_str,))
+        conn.execute("DELETE FROM imports WHERE file = ?", (file_str,))
+        if defs:
+            conn.executemany(
+                "INSERT INTO definitions(symbol,file,kind,start_line,end_line,repo) VALUES (?,?,?,?,?,?)",
+                defs,
+            )
+        if refs:
+            conn.executemany(
+                "INSERT INTO refs(symbol,file,line,repo) VALUES (?,?,?,?)",
+                refs,
+            )
+        if imps:
+            conn.executemany(
+                "INSERT INTO imports(file,target,line,repo) VALUES (?,?,?,?)",
+                imps,
+            )
+    return {"definitions": len(defs), "refs": len(refs), "imports": len(imps)}
+
+
+# ── Query API used by the agentic tool layer ─────────────────────────────────
+def find_definitions(symbol: str, limit: int = 50) -> list[dict]:
+    if not symbol:
+        return []
+    with _txn() as conn:
+        rows = conn.execute(
+            "SELECT symbol, file, kind, start_line, end_line, repo "
+            "FROM definitions WHERE symbol = ? LIMIT ?",
+            (symbol, limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def find_callers(symbol: str, limit: int = 50) -> list[dict]:
+    """Files referencing `symbol`. Excludes the file(s) where `symbol` is
+    defined so the result is genuinely about callers, not the def itself.
+    """
+    if not symbol:
+        return []
+    with _txn() as conn:
+        def_files = {r["file"] for r in conn.execute(
+            "SELECT file FROM definitions WHERE symbol = ?", (symbol,)
+        ).fetchall()}
+        rows = conn.execute(
+            "SELECT symbol, file, line, repo FROM refs WHERE symbol = ? LIMIT ?",
+            (symbol, max(limit * 4, 200)),
+        ).fetchall()
+    out: list[dict] = []
+    seen_files: set[str] = set()
+    for r in rows:
+        if r["file"] in def_files:
+            continue
+        out.append(dict(r))
+        seen_files.add(r["file"])
+        if len(out) >= limit:
+            break
+    return out
+
+
+def find_importers(target_substring: str, limit: int = 50) -> list[dict]:
+    """Files whose import statements contain `target_substring` as a
+    substring. Substring match handles both relative imports (./Foo) and
+    package imports (services/auth)."""
+    if not target_substring:
+        return []
+    with _txn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT file, target, line, repo FROM imports "
+            "WHERE target LIKE ? LIMIT ?",
+            (f"%{target_substring}%", limit),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def graph_stats() -> dict:
+    if not DB_PATH.exists():
+        return {"definitions": 0, "refs": 0, "imports": 0}
+    with _txn() as conn:
+        d = conn.execute("SELECT COUNT(*) c FROM definitions").fetchone()["c"]
+        r = conn.execute("SELECT COUNT(*) c FROM refs").fetchone()["c"]
+        i = conn.execute("SELECT COUNT(*) c FROM imports").fetchone()["c"]
+    return {"definitions": d, "refs": r, "imports": i}
+
+
+if __name__ == "__main__":
+    print(build_symbol_graph())

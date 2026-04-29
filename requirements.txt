@@ -1,7 +1,10 @@
 # PyTorch is installed separately (see scripts/setup.bat) with the CUDA 11.8 wheel.
 # faiss-cpu replaces chromadb/chroma-hnswlib — pre-built wheels, no compiler needed.
 faiss-cpu>=1.7.4
-sentence-transformers==3.0.1
+# sentence-transformers 3.0+ pulls transformers >= 4.40, sufficient for Qwen3.
+sentence-transformers>=3.0.1
+# Pinned floor for Qwen3-Embedding / Qwen3-Reranker config support.
+transformers>=4.45
 fastapi==0.111.0
 uvicorn==0.30.1
 httpx==0.27.0

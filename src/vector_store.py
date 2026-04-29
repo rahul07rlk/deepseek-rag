@@ -51,11 +51,19 @@ class VectorStore:
             if stored_model and stored_model != self._embed_model and saved.get("count", 0) > 0:
                 # Dimension mismatch — loading the stale FAISS index would crash at search time.
                 # Start fresh; the indexer will rebuild with the correct model.
+                # ASCII-only message: cp1252 consoles (Windows default) choke on
+                # arrows / em-dashes when stdout isn't reconfigured to UTF-8.
                 print(
-                    f"[VectorStore] Embedding model changed '{stored_model}' → '{self._embed_model}'. "
-                    f"Stale index discarded — re-run the indexer to rebuild."
+                    f"[VectorStore] Embedding model changed "
+                    f"'{stored_model}' -> '{self._embed_model}'. "
+                    f"Stale index discarded - re-run the indexer to rebuild."
                 )
                 self._index = self._make_index()
+                # Reset the in-memory state too, otherwise repo-map / stats
+                # see a non-empty self._data that's now misaligned with FAISS.
+                self._data.clear()
+                self._str_to_int.clear()
+                self._next_id = 0
                 return
             self._index = faiss.read_index(str(self._index_path))
             self._next_id = saved["next_id"]
