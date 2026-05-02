@@ -536,5 +536,62 @@ def graph_stats() -> dict:
     return {"definitions": d, "refs": r, "imports": i}
 
 
+# ── Multi-graph compat layer ─────────────────────────────────────────────────
+# When GRAPH_BACKEND is set (kuzu / sqlite via code_graph), redirect the
+# legacy callers (rag_engine, agentic, watcher) to the new engine. Functions
+# above are kept verbatim for backward compatibility — they remain the
+# fallback when the new graph isn't built yet.
+def _use_new_graph() -> bool:
+    import os
+    return os.getenv("USE_CODE_GRAPH", "true").lower() == "true"
+
+
+_legacy_neighbors_for_chunk = neighbors_for_chunk
+_legacy_find_definitions = find_definitions
+_legacy_find_callers = find_callers
+_legacy_find_importers = find_importers
+
+
+def neighbors_for_chunk(file: str, symbol: str = "", start_line: int = 1,
+                         end_line: int = 1, limit: int = 12) -> list[dict]:  # noqa: F811
+    if _use_new_graph():
+        try:
+            from src.code_graph import neighbors_for_chunk as _new
+            return _new(file, symbol, start_line, end_line, limit)
+        except Exception as e:
+            logger.debug(f"code_graph fallback to legacy: {e}")
+    return _legacy_neighbors_for_chunk(file, symbol, start_line, end_line, limit)
+
+
+def find_definitions(symbol: str, limit: int = 50) -> list[dict]:  # noqa: F811
+    if _use_new_graph():
+        try:
+            from src.code_graph import find_definitions as _new
+            return _new(symbol, limit)
+        except Exception:
+            pass
+    return _legacy_find_definitions(symbol, limit)
+
+
+def find_callers(symbol: str, limit: int = 50) -> list[dict]:  # noqa: F811
+    if _use_new_graph():
+        try:
+            from src.code_graph import find_callers as _new
+            return _new(symbol, limit)
+        except Exception:
+            pass
+    return _legacy_find_callers(symbol, limit)
+
+
+def find_importers(target_substring: str, limit: int = 50) -> list[dict]:  # noqa: F811
+    if _use_new_graph():
+        try:
+            from src.code_graph import find_importers as _new
+            return _new(target_substring, limit)
+        except Exception:
+            pass
+    return _legacy_find_importers(target_substring, limit)
+
+
 if __name__ == "__main__":
     print(build_symbol_graph())

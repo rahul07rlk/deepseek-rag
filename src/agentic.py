@@ -202,6 +202,134 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # ── Multi-graph: implementations + multi-hop traversal ──────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "find_implementations",
+            "description": (
+                "Symbols inheriting from / implementing a given base class or "
+                "interface. Use for type-hierarchy questions: 'who implements "
+                "IUserRepo?', 'subclasses of BaseHandler?'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "base": {"type": "string", "description": "Base class / interface name."},
+                },
+                "required": ["base"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_neighbors",
+            "description": (
+                "Multi-hop graph traversal from a seed file (and optional "
+                "symbol). Follows CALLS / IMPORTS / INHERITS / TESTS edges up "
+                "to max_hops. Use this when 1-hop callers/callees aren't "
+                "enough — e.g. 'trace this request from handler to DB'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string", "description": "Seed file path."},
+                    "symbol": {"type": "string", "description": "Optional starting symbol.", "default": ""},
+                    "kinds": {
+                        "type": "array",
+                        "description": "Edge kinds to follow.",
+                        "items": {"type": "string"},
+                        "default": ["CALLS", "IMPORTS"],
+                    },
+                    "max_hops": {"type": "integer", "default": 2},
+                    "max_results": {"type": "integer", "default": 25},
+                },
+                "required": ["file"],
+            },
+        },
+    },
+    # ── LSP: ground-truth defs/refs ─────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "lsp_definition",
+            "description": (
+                "Use a real language server (pyright/tsserver/gopls/rust-"
+                "analyzer/clangd/etc) to find the EXACT definition of a "
+                "symbol at a position. Use this when find_symbol returns "
+                "ambiguous matches or when types matter."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line": {"type": "integer", "description": "1-indexed line."},
+                    "character": {"type": "integer", "description": "0-indexed column.", "default": 0},
+                },
+                "required": ["file", "line"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lsp_references",
+            "description": (
+                "Use a real language server to find ALL references of a "
+                "symbol (typed, scope-aware). Better than find_callers when "
+                "the same name is reused in different contexts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file": {"type": "string"},
+                    "line": {"type": "integer"},
+                    "character": {"type": "integer", "default": 0},
+                },
+                "required": ["file", "line"],
+            },
+        },
+    },
+    # ── Sandbox: verify a code snippet before returning ─────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "verify_code",
+            "description": (
+                "Run static checks (syntax, types, lint, compile) on a code "
+                "snippet using the appropriate toolchain. Use this BEFORE "
+                "returning generated code so you catch hallucinated imports "
+                "or type errors. Returns pass/fail per check."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "language": {"type": "string", "description": "python|typescript|go|rust|java|cpp|c"},
+                    "code": {"type": "string", "description": "Source to check."},
+                },
+                "required": ["language", "code"],
+            },
+        },
+    },
+    # ── Git: recent changes / history ───────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "recent_changes",
+            "description": (
+                "Files modified in the last N git commits across all repos. "
+                "Use for debugging questions where the answer likely lies in "
+                "a recent change."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lookback": {"type": "integer", "default": 20},
+                },
+            },
+        },
+    },
 ]
 
 
@@ -357,6 +485,123 @@ def tool_repo_map(query: str = "", top_files: int = 30) -> str:
     return rendered or "(repo map empty — run reindex)"
 
 
+def tool_find_implementations(base: str) -> str:
+    try:
+        from src.code_graph import find_implementations
+    except Exception:
+        return "(graph unavailable)"
+    rows = find_implementations(base)
+    if not rows:
+        return f"No implementations found for `{base}`."
+    out = [f"{len(rows)} implementer(s) of `{base}`:"]
+    for r in rows:
+        sid = r.get("src_id", "")
+        out.append(f"- {sid} (line {r.get('line', 0)})")
+    return "\n".join(out)
+
+
+def tool_graph_neighbors(
+    file: str, symbol: str = "",
+    kinds: list | None = None,
+    max_hops: int = 2, max_results: int = 25,
+) -> str:
+    try:
+        from src.code_graph import multi_hop_neighbors
+    except Exception:
+        return "(graph unavailable)"
+    rows = multi_hop_neighbors(
+        seed_file=file,
+        seed_symbol=symbol or "",
+        kinds=list(kinds) if kinds else None,
+        max_hops=int(max_hops),
+        max_results=int(max_results),
+    )
+    if not rows:
+        return f"No graph neighbors within {max_hops} hops of {file}{':' + symbol if symbol else ''}."
+    out = [f"{len(rows)} neighbor(s):"]
+    for r in rows:
+        out.append(
+            f"- [hop={r.get('hop', '?')} via {r.get('edge_kind', '?')}] "
+            f"{r.get('kind', '?')} {r.get('name', '?')} @ {r.get('file', '')}:{r.get('line', 0)}"
+        )
+    return "\n".join(out)
+
+
+def tool_lsp_definition(file: str, line: int, character: int = 0) -> str:
+    fpath = _resolve_path(file)
+    if fpath is None:
+        return f"Error: file not found: {file}"
+    try:
+        from src.lsp import get_manager
+        mgr = get_manager()
+        # LSP positions are 0-indexed; tool surface uses 1-indexed lines.
+        defs = mgr.defs(fpath, max(0, int(line) - 1), int(character))
+    except Exception as e:
+        return f"LSP unavailable: {type(e).__name__}: {e}"
+    if not defs:
+        return "(no definition found via LSP — try find_symbol fallback)"
+    out = ["LSP definitions:"]
+    for d in defs:
+        out.append(f"- {d.get('path', '?')}:{int(d.get('line', 0)) + 1}")
+    return "\n".join(out)
+
+
+def tool_lsp_references(file: str, line: int, character: int = 0) -> str:
+    fpath = _resolve_path(file)
+    if fpath is None:
+        return f"Error: file not found: {file}"
+    try:
+        from src.lsp import get_manager
+        mgr = get_manager()
+        refs = mgr.refs(fpath, max(0, int(line) - 1), int(character))
+    except Exception as e:
+        return f"LSP unavailable: {type(e).__name__}: {e}"
+    if not refs:
+        return "(no references found via LSP — try find_callers fallback)"
+    out = [f"LSP references ({len(refs)}):"]
+    for r in refs:
+        out.append(f"- {r.get('path', '?')}:{int(r.get('line', 0)) + 1}")
+    return "\n".join(out)
+
+
+def tool_verify_code(language: str, code: str) -> str:
+    try:
+        from src.sandbox import verify_code
+    except Exception as e:
+        return f"Sandbox unavailable: {type(e).__name__}: {e}"
+    reports = verify_code(code, language)
+    if not reports:
+        return "(no checks ran)"
+    out = []
+    all_passed = True
+    for r in reports:
+        status = "SKIP" if r.skipped else ("PASS" if r.passed else "FAIL")
+        if not r.passed and not r.skipped:
+            all_passed = False
+        out.append(f"[{status}] {r.tool} ({r.duration_s:.2f}s)")
+        if r.stderr.strip():
+            out.append(r.stderr.strip()[:1500])
+        if r.error:
+            out.append(f"error: {r.error}")
+    out.insert(0, f"Verification: {'OK' if all_passed else 'FAILED'}")
+    return "\n".join(out)
+
+
+def tool_recent_changes(lookback: int = 20) -> str:
+    try:
+        from src.code_graph.extract import collect_recent_changes
+        from src.config import REPO_PATHS
+    except Exception as e:
+        return f"git unavailable: {type(e).__name__}: {e}"
+    files = collect_recent_changes(REPO_PATHS, lookback=int(lookback))
+    if not files:
+        return f"No git-tracked changes in the last {lookback} commits."
+    sample = sorted(files)[:80]
+    out = [f"{len(files)} files changed in last {lookback} commits (showing first 80):"]
+    out.extend(f"- {f}" for f in sample)
+    return "\n".join(out)
+
+
 def tool_read_files(items: list) -> str:
     """Batched read_file. Each item = {path, start_line?, end_line?}."""
     if not isinstance(items, list) or not items:
@@ -376,14 +621,29 @@ def tool_read_files(items: list) -> str:
 
 # ── Dispatcher ────────────────────────────────────────────────────────────────
 _DISPATCH = {
-    "retrieve":       lambda a: tool_retrieve(a.get("query", ""), a.get("top_k", 12)),
-    "read_file":      lambda a: tool_read_file(a.get("path", ""), a.get("start_line", 1), a.get("end_line", 0)),
-    "read_files":     lambda a: tool_read_files(a.get("items", [])),
-    "grep":           lambda a: tool_grep(a.get("pattern", ""), a.get("path_glob", "")),
-    "find_symbol":    lambda a: tool_find_symbol(a.get("symbol", "")),
-    "find_callers":   lambda a: tool_find_callers(a.get("symbol", "")),
-    "find_importers": lambda a: tool_find_importers(a.get("target", "")),
-    "repo_map":       lambda a: tool_repo_map(a.get("query", ""), a.get("top_files", 30)),
+    "retrieve":             lambda a: tool_retrieve(a.get("query", ""), a.get("top_k", 12)),
+    "read_file":            lambda a: tool_read_file(a.get("path", ""), a.get("start_line", 1), a.get("end_line", 0)),
+    "read_files":           lambda a: tool_read_files(a.get("items", [])),
+    "grep":                 lambda a: tool_grep(a.get("pattern", ""), a.get("path_glob", "")),
+    "find_symbol":          lambda a: tool_find_symbol(a.get("symbol", "")),
+    "find_callers":         lambda a: tool_find_callers(a.get("symbol", "")),
+    "find_importers":       lambda a: tool_find_importers(a.get("target", "")),
+    "repo_map":             lambda a: tool_repo_map(a.get("query", ""), a.get("top_files", 30)),
+    "find_implementations": lambda a: tool_find_implementations(a.get("base", "")),
+    "graph_neighbors":      lambda a: tool_graph_neighbors(
+        a.get("file", ""), a.get("symbol", ""),
+        a.get("kinds"), a.get("max_hops", 2), a.get("max_results", 25),
+    ),
+    "lsp_definition":       lambda a: tool_lsp_definition(
+        a.get("file", ""), a.get("line", 1), a.get("character", 0),
+    ),
+    "lsp_references":       lambda a: tool_lsp_references(
+        a.get("file", ""), a.get("line", 1), a.get("character", 0),
+    ),
+    "verify_code":          lambda a: tool_verify_code(
+        a.get("language", ""), a.get("code", ""),
+    ),
+    "recent_changes":       lambda a: tool_recent_changes(a.get("lookback", 20)),
 }
 
 
@@ -445,12 +705,146 @@ def dispatch(
     return result
 
 
+# ── Repo scope detection ─────────────────────────────────────────────────────
+def _detect_repo_scope(user_query: str) -> list[str]:
+    """Return names of repos explicitly mentioned in the query.
+
+    Used to inject a SCOPE constraint into the system prompt so the agent
+    doesn't drift into unrelated repos when the user targets a specific one.
+    E.g. "in deepseek-rag readme add content" → scoped to deepseek-rag only.
+
+    Repos are checked longest-name-first so "aelvyris-backend" is consumed
+    before "aelvyris" can false-positive as a substring match.
+    """
+    q_remaining = user_query.lower()
+    scoped: list[str] = []
+    # Longest name first prevents shorter names from matching inside longer ones.
+    for rp in sorted(REPO_PATHS, key=lambda p: len(p.name), reverse=True):
+        name = rp.name.lower()
+        if name in q_remaining:
+            scoped.append(rp.name)
+            # Mask matched span so its prefix doesn't fire on a later iteration.
+            q_remaining = q_remaining.replace(name, " " * len(name))
+    return scoped
+
+
+# ── Workspace layout hint (so the LLM emits Continue-resolvable paths) ───────
+def _workspace_layout_section() -> str:
+    """Tell the model where files live so its code suggestions carry paths
+    Continue's "Apply" button can actually resolve.
+
+    The IDE workspace root (the folder VS Code has open) is the COMMON parent
+    of every indexed repo. Continue resolves a path quoted in a code block
+    against that root: a bare ``src/utils/foo.ts`` tries to land at
+    ``<workspace>/src/utils/foo.ts`` and fails when there is no such folder
+    (multi-repo workspaces are exactly this case).
+
+    To make Apply work for both edits AND new files, the model must:
+      1. Use **workspace-relative** paths (include the repo folder name).
+      2. Put the path in the **code-fence info string**, the format
+         Continue's apply parser auto-detects:
+            ```language path/relative/to/workspace.ext
+      3. Use the same path on a "**File:**" header before the fence as a
+         human-readable belt-and-suspenders cue.
+    """
+    if not REPO_PATHS:
+        return ""
+
+    # Heuristic: workspace root is the common parent of every indexed repo
+    # (in the user's case, c:\My_Projects). When the repos don't share a
+    # common parent, fall back to listing them individually — better to be
+    # explicit than guess wrong.
+    try:
+        from os.path import commonpath
+        common = commonpath([str(rp) for rp in REPO_PATHS])
+    except (ValueError, OSError):
+        common = ""
+
+    workspace_root = common.replace("\\", "/") if common else ""
+    repo_examples: list[str] = []
+    for rp in REPO_PATHS[:6]:
+        try:
+            rel = rp.relative_to(common) if common else rp
+            rel_str = str(rel).replace("\\", "/") if common else str(rp).replace("\\", "/")
+        except ValueError:
+            rel_str = str(rp).replace("\\", "/")
+        repo_examples.append(f"  - `{rel_str}/`")
+    repo_lines = "\n".join(repo_examples)
+
+    # Build a concrete example using the first repo so the format is
+    # unambiguous to the model.
+    first_repo = repo_examples[0].strip("- `/ ") if repo_examples else "RepoName"
+    example_path = f"{first_repo}/src/utils/example.ts"
+
+    workspace_line = (
+        f"The IDE workspace root is `{workspace_root}/`. Each indexed repo "
+        "is a folder directly under it:\n"
+    ) if workspace_root else (
+        "Each indexed repo is a top-level folder in the IDE workspace:\n"
+    )
+
+    return (
+        "\n## Workspace layout (CRITICAL — read before answering)\n"
+        f"{workspace_line}"
+        f"{repo_lines}\n\n"
+        "The IDE's **Apply** button resolves the path quoted in your code "
+        "block AGAINST THE WORKSPACE ROOT. A bare path like "
+        "`src/utils/foo.ts` resolves to `<workspace-root>/src/utils/foo.ts` "
+        "— which does NOT exist (no repo lives directly under the root) — "
+        "so Apply fails with \"Could not resolve filepath to apply changes\" "
+        "and the user CANNOT use your code. This is the most common failure "
+        "mode and you must avoid it.\n\n"
+        "### MANDATORY format for every code suggestion\n"
+        "Every fenced code block MUST follow this **exact** structure — no "
+        "exceptions. Both the header line AND the code fence info string are "
+        "required; Continue reads the fence info string to locate the file, "
+        "and the header gives the user a human-readable cue.\n\n"
+        "**Editing an existing file:**\n"
+        f"**File:** `{example_path}`\n"
+        f"```typescript {example_path}\n"
+        "// COMPLETE file content — every line, not a partial snippet\n"
+        "```\n\n"
+        "**Creating a brand-new file** (Continue 1.x will create it on disk "
+        "automatically when Apply is clicked if the path does not yet exist):\n"
+        f"**File (new):** `{example_path}`\n"
+        f"```typescript {example_path}\n"
+        "// COMPLETE new file content\n"
+        "```\n\n"
+        "### Rules — non-negotiable\n"
+        "1. The path in the **header** and the path in the **fence info "
+        "string** MUST be identical character-for-character. A mismatch "
+        "causes Apply to silently fail or open the wrong file.\n"
+        "2. **NEVER** emit a path starting with `src/`, `app/`, `lib/`, "
+        "`components/`, `pages/`, `utils/`, etc. without the repo folder "
+        "name in front. Those fail to resolve against the workspace root.\n"
+        "3. Always output the **COMPLETE** file — every single line. "
+        "Do NOT use `// ... rest unchanged`, `// existing code`, "
+        "`// TODO: keep previous logic`, or any other abbreviation. "
+        "Continue's Apply patch requires the full file to merge correctly. "
+        "The output budget is 100 000 tokens — use it.\n"
+        "4. For **edits**, copy the EXACT path returned by `read_file`, "
+        "`grep`, or `find_symbol` — never reconstruct it from memory.\n"
+        "5. For **new files**, infer the repo prefix from the user's "
+        "request (\"in aelvyris-backend\" → `Aelvyris-Backend/`) or from "
+        "the imports the file would contain. When uncertain, ASK the user "
+        "before generating code.\n"
+        "6. On Windows the indexed paths use the double-folder nesting "
+        "pattern in some repos (e.g. `Aelvyris-Backend/Aelvyris-Backend/"
+        "src/...`). Mirror EXACTLY whatever path your tools returned — "
+        "never shorten or rewrite it.\n"
+        "7. After generating an edit or new file, state clearly: "
+        "\"Click **Apply** on the code block above to apply this change.\" "
+        "so the user knows the workflow.\n"
+    )
+
+
 # ── Seed-message construction ─────────────────────────────────────────────────
 def build_seed_messages(
     user_query: str,
     conversation_history: list[dict] | None = None,
     route=None,
     vector_query_override: str | None = None,
+    session_context: dict | None = None,
 ) -> list[dict]:
     """Build the initial messages for the agentic loop.
 
@@ -565,9 +959,101 @@ def build_seed_messages(
                 "User reported an error / failure. Search by the error string "
                 "via `grep`, then `read_file` the surrounding handler.\n"
             )
+        elif route.route == "WRITE_FILE":
+            files_str = ", ".join(target_files) if target_files else "(file named in the query)"
+            route_hint = (
+                "\n## Route: WRITE_FILE\n"
+                f"The user wants to add or modify content in: {files_str}.\n"
+                "Follow this exact procedure — no deviation:\n"
+                "1. Call `read_file` on the target file to get its CURRENT content.\n"
+                "2. Make ONLY the changes the user requested.\n"
+                "3. Output the COMPLETE updated file — no diffs, no partial snippets,\n"
+                "   no `// ... rest unchanged`. The user needs the full file to Apply.\n"
+                "Do NOT retrieve, summarize, or explore other files/repos. "
+                "Stay focused on the specific file the user named.\n"
+            )
+        elif route.route == "HOW_X_WORKS":
+            route_hint = (
+                "\n## Route: HOW_X_WORKS\n"
+                "This is an explanatory question. Use `retrieve` to pull relevant "
+                "implementations, then `read_file` at the returned locations for "
+                "detail. Stay focused on the specific subject the user asked about. "
+                "Do NOT produce unsolicited summaries of other components or repos.\n"
+            )
+        elif route.route == "IMPLEMENT_FEATURE":
+            route_hint = (
+                "\n## Route: IMPLEMENT_FEATURE\n"
+                "The user wants new code written. Before writing:\n"
+                "1. Use `retrieve` or `find_symbol` to find existing patterns, "
+                "   interfaces, and conventions in the relevant repo.\n"
+                "2. Use `read_file` on closely related files to match style.\n"
+                "3. Output COMPLETE, production-ready code that integrates cleanly "
+                "   with what already exists. Follow the workspace path format.\n"
+            )
+        elif route.route == "REFACTOR":
+            route_hint = (
+                "\n## Route: REFACTOR\n"
+                "The user wants existing code improved. Procedure:\n"
+                "1. Use `read_file` on the target file(s) to get the full current code.\n"
+                "2. Understand the existing structure before proposing changes.\n"
+                "3. Output the COMPLETE refactored file — not a diff, not partial. "
+                "   The user needs the full file to Apply in the IDE.\n"
+                "Do not change behavior without flagging it — refactors must be safe.\n"
+            )
 
+    # ── Session context (soft hint from conversation history) ────────────────
+    # When the conversation has established a working context (recent turns
+    # retrieved files from Aelvyris-Backend, or the user asked about specific
+    # files there), carry that forward as a soft scope bias for the current
+    # query — but ONLY when the current query has no explicit repo mention.
+    # This fixes multi-context chats: "how does error handling work?" after
+    # 5 turns about Backend should search Backend, not all 5 repos equally.
+    session_ctx_section = ""
+    current_explicit_scope = _detect_repo_scope(user_query)
+    if session_context and not current_explicit_scope:
+        history_repos = [r for r in (session_context.get("repos") or []) if r]
+        history_files = [f for f in (session_context.get("files") or []) if f]
+        if history_repos or history_files:
+            parts: list[str] = []
+            if history_repos:
+                parts.append(
+                    "Repos from recent turns: "
+                    + ", ".join(f"`{r}`" for r in history_repos[:4])
+                )
+            if history_files:
+                parts.append(
+                    "Files referenced recently: "
+                    + ", ".join(f"`{f}`" for f in history_files[:6])
+                )
+            session_ctx_section = (
+                "\n## Conversation Context\n"
+                + "\n".join(parts) + "\n"
+                "The current query does not name a specific repo. Based on the "
+                "conversation so far, prioritize the repos/files above in your "
+                "tool calls — unless the query content clearly points elsewhere. "
+                "This is a soft hint, not a hard constraint.\n"
+            )
+
+    # ── Repo scope constraint ─────────────────────────────────────────────────
+    # When the user names a specific repo in their query, inject a hard scope
+    # so the agent cannot drift into unrelated repos during tool calls.
+    repo_scope = _detect_repo_scope(user_query)
+    scope_section = ""
+    if repo_scope:
+        scope_names = " and ".join(f"`{r}`" for r in repo_scope)
+        scope_section = (
+            f"\n⚠ **SCOPE CONSTRAINT — MANDATORY**: The user's query explicitly "
+            f"references {scope_names}. You MUST restrict ALL tool calls "
+            f"(read_file, grep, retrieve, find_symbol, find_callers, find_importers) "
+            f"to files within {scope_names}. Do NOT read, summarize, or explore "
+            "files from any other repo unless the user explicitly asks. Violating "
+            "this constraint is the #1 failure mode — a complete summary of the "
+            "wrong repo is not a valid answer.\n"
+        )
+
+    workspace_section = _workspace_layout_section()
     system_message = f"""You are an expert software engineer with full agentic access to the codebase.
-{map_section}{ctx_section}{confidence_hint}{route_hint}
+{map_section}{ctx_section}{confidence_hint}{route_hint}{session_ctx_section}{scope_section}{workspace_section}
 ## Your Tools
 You can iteratively call these tools to investigate the code before answering:
   - `retrieve(query, top_k)`       — hybrid semantic search
@@ -591,7 +1077,11 @@ You can iteratively call these tools to investigate the code before answering:
 - Do not hallucinate code. If a tool returns nothing useful, try a different
   tool or admit the codebase doesn't contain what was asked for.
 - Only emit your final answer after you have enough evidence — keep calling
-  tools until you do, up to {max_turns} tool turns."""
+  tools until you do, up to {max_turns} tool turns.
+- **Stay on task**: answer EXACTLY what the user asked. If the user asks to
+  edit file X, read X and produce the modified file — do NOT wander into
+  unrelated repos or produce unsolicited codebase summaries. Breadth is not
+  a virtue here; precision is."""
 
     messages: list[dict] = [{"role": "system", "content": system_message}]
     if conversation_history:

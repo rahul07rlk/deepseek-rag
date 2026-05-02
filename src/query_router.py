@@ -60,6 +60,36 @@ HOW_PHRASES: tuple[str, ...] = (
     "explain how", "walk me through",
 )
 
+IMPLEMENT_PHRASES: tuple[str, ...] = (
+    "implement", "create a", "create the", "build a", "build the",
+    "write a", "write the", "generate a", "generate the",
+    "add a feature", "add the feature", "develop a", "develop the",
+    "code a", "code the", "make a", "make the",
+)
+
+REFACTOR_PHRASES: tuple[str, ...] = (
+    "refactor", "refactoring",
+    "improve", "clean up", "cleanup",
+    "simplify", "optimise", "optimize",
+    "reorganize", "reorganise", "restructure",
+    "extract", "decouple", "modularize",
+)
+
+# Phrases that together with a file mention signal "user wants to write/edit a file".
+# Checked as substrings after lowercasing.
+WRITE_FILE_PHRASES: tuple[str, ...] = (
+    "add some content", "add content", "add a section", "add section",
+    "add to readme", "add to the readme", "add to the file", "add to file",
+    "update readme", "update the readme", "update the file", "update the doc",
+    "edit readme", "edit the readme", "edit the file", "modify the file",
+    "modify readme", "write to the file", "write to file",
+    "append to", "insert into",
+    "add a note", "add notes", "add documentation", "add docs",
+    "add a description", "add description",
+    "add info", "add information", "add details",
+    "add example", "add examples", "add usage",
+)
+
 
 @dataclass
 class RouteDecision:
@@ -128,6 +158,26 @@ def classify(query: str) -> RouteDecision:
             note="quoted string",
         )
 
+    # ── WRITE_FILE: user wants to add/edit/modify content in a specific file. ──
+    # Requires BOTH a file mention (path_count >= 1) AND a write-intent phrase.
+    # Placed before FILE_LOOKUP so explicit write intent wins over read intent.
+    # Agent is told: read the target file, make the changes, output full result.
+    # HyDE / multi-query deliberately off — no retrieval drift into other repos.
+    _has_write_intent = any(p in q for p in WRITE_FILE_PHRASES)
+    if _has_write_intent and path_count >= 1:
+        return RouteDecision(
+            route="WRITE_FILE",
+            analysis=analysis,
+            use_hyde=False,
+            use_multi_query=False,
+            seed_strategy="minimal",
+            max_tool_turns=6,
+            suggested_top_k=4,
+            seed_token_budget=4000,
+            note="write/edit file intent + file mention",
+            target_files=list(analysis.paths),
+        )
+
     # ── FILE_LOOKUP: file/path mentioned, no question semantics. ──────────────
     if (
         path_count >= 1
@@ -182,7 +232,41 @@ def classify(query: str) -> RouteDecision:
             note="debug query",
         )
 
+    # ── IMPLEMENT_FEATURE: user wants new code written. ───────────────────────
+    # Retrieve existing patterns/interfaces first (BM25-heavy, no HyDE drift).
+    # Separate from HOW_X_WORKS — this needs code generation, not explanation.
+    if any(p in q for p in IMPLEMENT_PHRASES):
+        return RouteDecision(
+            route="IMPLEMENT_FEATURE",
+            analysis=analysis,
+            use_hyde=False,
+            use_multi_query=True,
+            seed_strategy="both",
+            max_tool_turns=12,
+            suggested_top_k=20,
+            seed_token_budget=25000,
+            note="implement/create intent",
+        )
+
+    # ── REFACTOR: improve/restructure existing code. ──────────────────────────
+    # Needs whole-file context more than HyDE; read-heavy tool loop.
+    if any(p in q for p in REFACTOR_PHRASES):
+        return RouteDecision(
+            route="REFACTOR",
+            analysis=analysis,
+            use_hyde=False,
+            use_multi_query=True,
+            seed_strategy="both",
+            max_tool_turns=10,
+            suggested_top_k=20,
+            seed_token_budget=25000,
+            note="refactor/improve intent",
+        )
+
     # ── HOW_X_WORKS: explanatory / paraphrase-friendly prose. ─────────────────
+    # Catch-all for prose questions. HyDE helps bridge question→code vocabulary.
+    # Guard: only fires when sym_count == 0 (pure prose) OR explicit how-phrase.
+    # Without the guard this was catching everything including implement/refactor.
     if any(p in q for p in HOW_PHRASES) or sym_count == 0:
         return RouteDecision(
             route="HOW_X_WORKS",

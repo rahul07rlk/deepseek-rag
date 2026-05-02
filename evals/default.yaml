@@ -1,0 +1,60 @@
+# Default eval suite for DeepSeek RAG.
+# Edit to reflect real questions about your indexed repos.
+# Run: python -m src.eval.run --suite evals/default.yaml
+
+- id: rag-overview
+  query: what does this proxy do?
+  intent: OVERVIEW
+  must_cite:
+    - README.md
+  contains:
+    - rag
+  tags: [overview]
+
+- id: retrieve-defined-where
+  query: where is the retrieve function defined?
+  intent: SYMBOL_LOOKUP
+  must_cite:
+    - src/rag_engine.py
+  tags: [symbol]
+
+- id: watcher-debounce
+  query: how does the watcher debounce work?
+  intent: HOW_X_WORKS
+  must_cite:
+    - src/watcher.py
+  contains:
+    - debounce
+  tags: [behavior, watcher]
+
+- id: cache-invalidation
+  query: how does the answer cache invalidate stale entries?
+  intent: HOW_X_WORKS
+  must_cite:
+    - src/answer_cache.py
+  contains:
+    - invalidate
+  tags: [behavior, cache]
+
+- id: deepseek-api-call
+  query: where does the proxy call the DeepSeek API?
+  intent: SYMBOL_LOOKUP
+  must_cite:
+    - src/proxy_server.py
+  tags: [symbol, api]
+
+- id: bm25-fusion
+  query: how is BM25 fused with vector search?
+  intent: HOW_X_WORKS
+  must_cite:
+    - src/rag_engine.py
+  contains:
+    - rrf
+  tags: [retrieval]
+
+- id: agentic-tool-loop
+  query: how does the agentic tool-use loop work?
+  intent: HOW_X_WORKS
+  must_cite:
+    - src/agentic.py
+  tags: [agent]

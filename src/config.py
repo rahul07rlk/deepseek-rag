@@ -203,6 +203,14 @@ DEEPSEEK_THINKING = os.getenv("DEEPSEEK_THINKING", "enabled")
 # Reasoning effort when thinking is enabled: "high" or "max".
 DEEPSEEK_REASONING_EFFORT = os.getenv("DEEPSEEK_REASONING_EFFORT", "max")
 
+# Edit/apply pass-through thinking override.
+#   "inherit" (default) — respect DEEPSEEK_THINKING for IDE edit/apply requests
+#   "enabled"           — force thinking on for edit/apply (better quality, slower)
+#   "disabled"          — force thinking off for edit/apply (faster, deterministic;
+#                         use only if a Continue build can't tolerate reasoning_content
+#                         in the apply stream)
+EDIT_APPLY_THINKING = os.getenv("EDIT_APPLY_THINKING", "inherit").lower()
+
 DEEPSEEK_TIMEOUT = 180
 
 # ── Proxy server ──────────────────────────────────────────────────────────────
@@ -387,6 +395,60 @@ CONVERSATION_AWARE_RETRIEVAL = (
 CONVERSATION_HISTORY_MAX_CHARS = int(os.getenv("CONVERSATION_HISTORY_MAX_CHARS", "600"))
 # Below this length (chars) and the query is treated as potentially vague.
 CONVERSATION_VAGUE_QUERY_CHARS = int(os.getenv("CONVERSATION_VAGUE_QUERY_CHARS", "40"))
+
+# ── Multi-graph code intelligence (Kuzu / SQLite) ────────────────────────────
+# Backend selection for the code graph that replaces the legacy flat symbol
+# graph. ``auto`` prefers Kuzu when installed, falls back to SQLite.
+GRAPH_BACKEND = os.getenv("GRAPH_BACKEND", "auto").lower()
+USE_CODE_GRAPH = os.getenv("USE_CODE_GRAPH", "true").lower() == "true"
+
+# ── Headless LSP enrichment ──────────────────────────────────────────────────
+# When LSP servers are installed (pyright, tsserver, gopls, rust-analyzer,
+# clangd, jdtls, …) the indexer adds ground-truth CALLS edges to the graph
+# on top of the heuristic regex/tree-sitter ones. Set to "false" to disable
+# even when servers are available.
+LSP_ENRICH_ENABLED = os.getenv("LSP_ENRICH_ENABLED", "auto")
+
+# ── Git-aware watcher tunables ───────────────────────────────────────────────
+# How often to poll each repo's HEAD (s). Bigger = less git overhead.
+GIT_HEAD_POLL_INTERVAL_S = float(os.getenv("GIT_HEAD_POLL_INTERVAL_S", "10.0"))
+# Storm detection: pause indexing if more than N file events fire within
+# WINDOW seconds. Resumes after COOLDOWN seconds.
+INDEX_STORM_WINDOW_S = float(os.getenv("INDEX_STORM_WINDOW_S", "2.0"))
+INDEX_STORM_THRESHOLD = int(os.getenv("INDEX_STORM_THRESHOLD", "30"))
+INDEX_STORM_COOLDOWN_S = float(os.getenv("INDEX_STORM_COOLDOWN_S", "8.0"))
+
+# ── Late-interaction (ColBERT-style) ─────────────────────────────────────────
+# Token-level retrieval that captures identifier-level matches a single
+# pooled embedding can miss. Requires `pip install pylate`. Disabled silently
+# when pylate isn't installed.
+LATE_INTERACTION_ENABLED = os.getenv("LATE_INTERACTION_ENABLED", "true").lower() == "true"
+LATE_INTERACTION_MODEL = os.getenv(
+    "LATE_INTERACTION_MODEL", "lightonai/Reason-ModernColBERT",
+)
+LATE_INTERACTION_DEVICE = os.getenv("LATE_INTERACTION_DEVICE", "cpu")
+
+# ── Confidence-calibrated routing thresholds ─────────────────────────────────
+# Calibrated confidence is mapped to one of:
+#   ANSWER_NOW (>= ANSWER_NOW)  → single-shot, no agent loop
+#   ONE_MORE_ROUND (>= AGENTIC) → small extra retrieval pass
+#   AGENTIC_SEARCH (< AGENTIC)  → engage the full tool loop
+#   ASK_CLARIFY (<= CLARIFY)    → return clarifying question
+CONFIDENCE_ANSWER_NOW = float(os.getenv("CONFIDENCE_ANSWER_NOW", "0.72"))
+CONFIDENCE_AGENTIC = float(os.getenv("CONFIDENCE_AGENTIC", "0.30"))
+CONFIDENCE_CLARIFY = float(os.getenv("CONFIDENCE_CLARIFY", "0.10"))
+
+# ── Sandbox verifier ─────────────────────────────────────────────────────────
+# Static checks (syntax/types/lint/compile) on generated code before returning.
+# Per-checker timeouts cap how long any single tool can run.
+SANDBOX_ENABLED = os.getenv("SANDBOX_ENABLED", "true").lower() == "true"
+SANDBOX_TIMEOUT_S = float(os.getenv("SANDBOX_TIMEOUT_S", "12"))
+SANDBOX_RUN_MYPY = os.getenv("SANDBOX_RUN_MYPY", "false").lower() == "true"
+
+# ── Streaming agent thoughts ─────────────────────────────────────────────────
+# When true, SSE comments include human-readable progress events
+# ("agent turn=2 tool=grep …") so the user can watch the loop.
+STREAM_AGENT_THOUGHTS = os.getenv("STREAM_AGENT_THOUGHTS", "true").lower() == "true"
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 

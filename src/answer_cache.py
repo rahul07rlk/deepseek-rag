@@ -1,38 +1,29 @@
-"""Semantic answer cache.
+"""Snapshot-versioned semantic answer cache.
 
 After a query is answered, embed the original question and store
-``(query_embedding, query_text, answer, route, timestamp)`` to disk. On the
-next query, embed it, compute cosine similarity against every cached entry,
-and short-circuit the entire RAG pipeline when the best match is above
-``SEMANTIC_CACHE_THRESHOLD``.
+``(query_embedding, query_text, answer, snapshot_id, evidence_files,
+files_fingerprint, route, timestamp, component_versions)`` to disk.
 
-Why this exists
----------------
-Repeated questions ("content of this repo?" twice in 30 minutes, observed in
-the proxy log) currently re-run the full agentic loop — embedding, hybrid
-search, rerank, 6+ tool calls, ~30k tokens. With a semantic cache, the
-second query is a single embed + dot-product against ≤200 entries (~10ms)
-and returns instantly.
+Lookup is a two-stage filter:
+  1. Hard match on ``component_versions`` — entries built with a different
+     embedder / reranker / prompt template are immediately discarded.
+  2. Cosine similarity against the surviving vectors. Hits below the
+     threshold are dropped.
+  3. Per-file freshness check — for the matched entry, recompute the
+     fingerprint of the evidence files cited at answer time. If any of
+     them changed, the entry is treated as stale (deleted, miss returned).
 
-Why semantic, not exact-string
-------------------------------
-"content of this repo?" ≈ "what is this repo about?" ≈ "summarise the
-codebase" — same intent, different wording. Embedding similarity catches
-all three; an exact-string cache would only catch the first.
+This replaces the legacy "blow the entire cache on any save" invalidation
+with surgical per-file invalidation. A save in `module_a.py` only
+invalidates answers whose evidence cited `module_a.py`; answers about
+`module_b.py` survive untouched.
 
-Invalidation
-------------
-- TTL (``SEMANTIC_CACHE_TTL_S``, default 1h) — bounds staleness even when
-  files don't change.
-- Index rebuild — ``reset()`` is called from ``schedule_bm25_rebuild`` so
-  any file save invalidates the entire cache. Conservative but safe.
+Storage layout (under ``codebase_index/semantic_cache/``):
+  - ``entries.json`` — list of dicts (q, a, ts, route, snapshot, versions,
+    evidence_files, evidence_fp)
+  - ``vectors.npy`` — N×dim float32 array, row-aligned with ``entries``
 
-Storage layout (under ``codebase_index/semantic_cache/``)
----------------------------------------------------------
-- ``entries.json`` — list of ``{q, a, ts, route}`` dicts
-- ``vectors.npy`` — N×dim float32 array, row-aligned with ``entries``
-
-Both files are written atomically together so partial-write corruption
+Both files are written atomically together. Partial-write corruption
 returns an empty cache rather than crashing.
 """
 from __future__ import annotations
@@ -51,6 +42,11 @@ from src.config import (
     SEMANTIC_CACHE_THRESHOLD,
     SEMANTIC_CACHE_TTL_S,
 )
+from src.snapshot import (
+    component_versions,
+    current_snapshot,
+    files_fingerprint,
+)
 from src.utils.logger import get_logger
 
 logger = get_logger("answer_cache", "proxy.log")
@@ -63,7 +59,6 @@ _VEC_FILE = _CACHE_DIR / "vectors.npy"
 class _Cache:
     def __init__(self) -> None:
         self._lock = RLock()
-        # entries[i] aligns with self._vecs[i].
         self._entries: list[dict] = []
         self._vecs: Optional[np.ndarray] = None
         self._load()
@@ -78,7 +73,6 @@ class _Cache:
                     or self._vecs.size == 0
                     or len(self._entries) != self._vecs.shape[0]
                 ):
-                    # Mismatched shapes — discard and start fresh.
                     self._entries = []
                     self._vecs = None
                 else:
@@ -104,14 +98,18 @@ class _Cache:
         except Exception as e:
             logger.warning(f"Cache save failed: {e}")
 
-    def _purge_expired(self) -> None:
+    def _purge_expired_and_versioned(self, current_versions: str) -> None:
         if not self._entries or self._vecs is None:
             return
         now = time.time()
-        keep_idx = [
-            i for i, e in enumerate(self._entries)
-            if (now - e.get("ts", 0)) <= SEMANTIC_CACHE_TTL_S
-        ]
+        keep_idx: list[int] = []
+        for i, e in enumerate(self._entries):
+            age = now - e.get("ts", 0)
+            if age > SEMANTIC_CACHE_TTL_S:
+                continue
+            if e.get("versions") and e["versions"] != current_versions:
+                continue
+            keep_idx.append(i)
         if len(keep_idx) == len(self._entries):
             return
         if not keep_idx:
@@ -121,12 +119,16 @@ class _Cache:
         self._entries = [self._entries[i] for i in keep_idx]
         self._vecs = self._vecs[keep_idx]
 
-    def lookup(self, query_emb: np.ndarray, threshold: float) -> Optional[dict]:
+    def lookup(
+        self,
+        query_emb: np.ndarray,
+        threshold: float,
+        current_versions: str,
+    ) -> Optional[dict]:
         with self._lock:
-            self._purge_expired()
+            self._purge_expired_and_versioned(current_versions)
             if not self._entries or self._vecs is None or self._vecs.size == 0:
                 return None
-            # Embeddings are L2-normalized → dot product == cosine similarity.
             q = query_emb.astype(np.float32, copy=False).reshape(-1)
             if q.shape[0] != self._vecs.shape[1]:
                 logger.warning(
@@ -139,38 +141,98 @@ class _Cache:
             sims = self._vecs @ q
             best_idx = int(np.argmax(sims))
             best_sim = float(sims[best_idx])
-            if best_sim >= threshold:
-                hit = dict(self._entries[best_idx])
-                hit["similarity"] = best_sim
-                return hit
-            return None
+            if best_sim < threshold:
+                return None
+
+            entry = self._entries[best_idx]
+            # Per-file freshness: recompute fingerprint of cited evidence
+            # files. If anything changed, this answer is stale even though
+            # the query embedding still matches.
+            evidence = entry.get("evidence_files") or []
+            if evidence:
+                current_fp = files_fingerprint(evidence)
+                if current_fp != entry.get("evidence_fp"):
+                    logger.info(
+                        f"Cache hit dropped (evidence stale): {entry.get('q', '')[:60]}"
+                    )
+                    self._invalidate_index(best_idx)
+                    self._save()
+                    return None
+
+            hit = dict(entry)
+            hit["similarity"] = best_sim
+            return hit
+
+    def _invalidate_index(self, idx: int) -> None:
+        if 0 <= idx < len(self._entries):
+            self._entries.pop(idx)
+            if self._vecs is not None:
+                self._vecs = np.delete(self._vecs, idx, axis=0)
+
+    def invalidate_for_file(self, file_path: str) -> int:
+        """Drop every entry whose evidence cited ``file_path``.
+
+        Returns the count of entries dropped. Called by the watcher on
+        per-file save instead of nuking the whole cache.
+        """
+        with self._lock:
+            if not self._entries:
+                return 0
+            target = file_path.replace("\\", "/").lower()
+            keep_idx: list[int] = []
+            for i, e in enumerate(self._entries):
+                evidence = [
+                    str(f).replace("\\", "/").lower()
+                    for f in (e.get("evidence_files") or [])
+                ]
+                if target in evidence:
+                    continue
+                keep_idx.append(i)
+            dropped = len(self._entries) - len(keep_idx)
+            if dropped == 0:
+                return 0
+            if not keep_idx:
+                self._entries = []
+                self._vecs = None
+            else:
+                self._entries = [self._entries[i] for i in keep_idx]
+                if self._vecs is not None:
+                    self._vecs = self._vecs[keep_idx]
+            self._save()
+            logger.info(f"Cache: invalidated {dropped} entries citing {file_path}")
+            return dropped
 
     def put(
         self,
         query: str,
         query_emb: np.ndarray,
         answer: str,
+        evidence_files: list[str] | None = None,
         route: str = "",
     ) -> None:
         with self._lock:
-            self._purge_expired()
+            versions = component_versions()
+            self._purge_expired_and_versioned(versions)
             v = query_emb.astype(np.float32, copy=False).reshape(1, -1)
+            evidence = list(evidence_files or [])
             entry = {
                 "q": query,
                 "a": answer,
                 "ts": time.time(),
                 "route": route,
+                "snapshot": current_snapshot().id,
+                "versions": versions,
+                "evidence_files": evidence,
+                "evidence_fp": files_fingerprint(evidence) if evidence else "",
             }
             if self._vecs is None or self._vecs.size == 0:
                 self._vecs = v.copy()
                 self._entries = [entry]
             else:
                 if v.shape[1] != self._vecs.shape[1]:
-                    # Embedder swapped under us — rebuild from scratch.
                     self._entries = [entry]
                     self._vecs = v.copy()
                 else:
-                    # FIFO eviction once we exceed the cap.
                     overflow = (len(self._entries) + 1) - SEMANTIC_CACHE_MAX_ENTRIES
                     if overflow > 0:
                         self._entries = self._entries[overflow:]
@@ -199,6 +261,8 @@ class _Cache:
                 "threshold": SEMANTIC_CACHE_THRESHOLD,
                 "ttl_s": SEMANTIC_CACHE_TTL_S,
                 "max_entries": SEMANTIC_CACHE_MAX_ENTRIES,
+                "snapshot": current_snapshot().id,
+                "versions": component_versions(),
             }
 
 
@@ -213,28 +277,26 @@ def _get() -> _Cache:
 
 
 def lookup(query: str) -> Optional[dict]:
-    """Return ``{q, a, ts, route, similarity}`` if the cache has a near match,
-    else None. Safe to call regardless of feature flag — returns None when
-    disabled or on any internal error."""
     if not SEMANTIC_CACHE_ENABLED or not query:
         return None
     try:
-        # Reuse the LRU-cached query embedder so identical strings cost nothing.
         from src.rag_engine import _embed_query
 
         emb = np.frombuffer(_embed_query(query), dtype=np.float32)
-        return _get().lookup(emb, SEMANTIC_CACHE_THRESHOLD)
+        return _get().lookup(emb, SEMANTIC_CACHE_THRESHOLD, component_versions())
     except Exception as e:
         logger.warning(f"Cache lookup failed: {e}")
         return None
 
 
-def put(query: str, answer: str, route: str = "") -> None:
-    """Store an answered query. No-op when caching is disabled or the answer
-    is empty / clearly an error sentinel."""
+def put(
+    query: str,
+    answer: str,
+    route: str = "",
+    evidence_files: list[str] | None = None,
+) -> None:
     if not SEMANTIC_CACHE_ENABLED or not query or not answer:
         return
-    # Don't cache obvious failure modes.
     stripped = answer.strip()
     if len(stripped) < 20 or stripped.lower().startswith(("error:", "(no ", "i don't")):
         return
@@ -242,14 +304,21 @@ def put(query: str, answer: str, route: str = "") -> None:
         from src.rag_engine import _embed_query
 
         emb = np.frombuffer(_embed_query(query), dtype=np.float32)
-        _get().put(query, emb, answer, route)
+        _get().put(query, emb, answer, evidence_files=evidence_files, route=route)
     except Exception as e:
         logger.warning(f"Cache put failed: {e}")
 
 
+def invalidate_for_file(file_path: str) -> int:
+    """Per-file cache invalidation — called by the watcher on save."""
+    try:
+        return _get().invalidate_for_file(file_path)
+    except Exception as e:
+        logger.warning(f"Per-file invalidation failed: {e}")
+        return 0
+
+
 def reset() -> None:
-    """Wipe the cache. Called when the index is rebuilt — file changes can
-    invalidate any prior answer."""
     try:
         _get().reset()
     except Exception as e:

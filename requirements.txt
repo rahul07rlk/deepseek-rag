@@ -21,3 +21,21 @@ numpy>=1.24.0,<2.0
 voyageai>=0.2.3
 pytest==8.2.2
 pytest-asyncio==0.23.7
+
+# ── Optional: multi-graph (Kuzu embedded property graph) ─────────────────────
+# Falls back silently to SQLite when not installed. Adds ~30 MB.
+kuzu>=0.4.0; python_version >= "3.10"
+
+# ── Optional: late-interaction retrieval (ColBERT/PyLate) ────────────────────
+# Token-level retrieval. Disabled cleanly when not installed.
+# pylate>=1.0.0   # uncomment to enable
+
+# ── Optional: eval suite YAML loader ─────────────────────────────────────────
+PyYAML>=6.0
+
+# ── Optional: sandbox verifier toolchain (install per-language as needed) ────
+# Python   : pip install ruff mypy
+# TS/JS    : npm i -g typescript eslint
+# Go       : gofmt + go vet ship with the Go toolchain
+# Rust     : rustup default stable
+# Java/C++ : javac, clang/gcc from your system toolchain

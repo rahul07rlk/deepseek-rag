@@ -544,12 +544,38 @@ def _conversation_aware_query(
     if not CONVERSATION_AWARE_RETRIEVAL:
         return query, False
     q = (query or "").strip()
-    # A query is vague when it's BOTH short AND uses a referential pronoun.
-    # Either signal alone is too noisy: short queries can be precise
-    # ("fix indexer.py:401"), and long queries with pronouns are usually
-    # self-contained ("explain how this module's caching works").
+
+    # Case 1 — Vague follow-up: short query with a referential pronoun.
+    # "fix it", "still wrong", "what about that" — enriched with the last
+    # assistant's code/error snippets so retrieval has concrete search terms.
+    # Guard: BOTH conditions must hold — short alone is too noisy
+    # ("fix indexer.py:401") and pronoun alone is too noisy
+    # ("explain how this module works" is self-contained).
     is_vague = len(q) <= CONVERSATION_VAGUE_QUERY_CHARS and _has_pronoun(q)
-    if not is_vague:
+
+    # Case 2 — Contextual continuation: the query is not vague BUT shares a
+    # meaningful token with the last assistant turn. E.g. assistant discussed
+    # "sessionStore.ts" in turn 3; user asks "how does session invalidation
+    # work?" — the shared "session" token links them and retrieval should
+    # pull session-related chunks from the same area the previous answer cited.
+    # Threshold: ≥1 content token (len > 4, not a stop-word) must match.
+    is_contextual = False
+    if not is_vague and conversation_history:
+        excerpt_peek = _history_excerpt_for_retrieval(conversation_history)
+        if excerpt_peek:
+            q_content_tokens = {
+                w.lower() for w in re.split(r"\W+", q)
+                if len(w) > 4 and w.lower() not in {
+                    "where", "which", "their", "about", "there", "would",
+                    "could", "should", "these", "those", "above", "other",
+                    "every", "after", "while", "until", "since", "based",
+                }
+            }
+            excerpt_lower = excerpt_peek.lower()
+            if q_content_tokens and any(tok in excerpt_lower for tok in q_content_tokens):
+                is_contextual = True
+
+    if not is_vague and not is_contextual:
         return query, False
     excerpt = _history_excerpt_for_retrieval(conversation_history)
     if not excerpt:
@@ -628,7 +654,24 @@ def retrieve(
     vec_hits, vec_sim = _multi_query_recall(vector_variants, CANDIDATE_POOL)
     bm_hits = _multi_query_bm25(bm25_variants, CANDIDATE_POOL)
 
+    # ── Late-interaction (ColBERT-style) recall, when available. ─────────────
+    li_hits: list[tuple[str, float]] = []
+    try:
+        from src.late_interaction import available as li_available
+        from src.late_interaction import search as li_search
+        if li_available():
+            li_hits = li_search(retrieval_query, k=CANDIDATE_POOL)
+    except Exception as e:
+        logger.debug(f"Late-interaction skipped: {e}")
+
     fused = _rrf_fuse(vec_hits, bm_hits, alpha=effective_alpha)
+    if li_hits:
+        # Fold LI ranking into the fused list with a small weight.
+        rrf_k = 60
+        scores = dict(fused)
+        for rank, (doc_id, _) in enumerate(li_hits):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 0.4 * (1.0 / (rrf_k + rank))
+        fused = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     if not fused:
         logger.warning("No hits from either retriever.")
         return "", 0, []
@@ -843,11 +886,55 @@ def retrieve(
         f"{conf_tag}{expansion_tag} | "
         f"~{actual_tokens} tokens | Files: {files_cited}"
     )
-    # Attach confidence to every emitted meta — callers (seed builder,
-    # agentic loop) can read it without recomputing.
+    # ── Calibrated confidence + routing policy ───────────────────────────────
+    # Replaces the simple "top rerank score" confidence with a multi-signal
+    # calibration that the policy layer can act on.
+    try:
+        from src.confidence import ConfidenceSignals, decide, hint_for
+
+        # Pull a second-rank score from the rerank list when available
+        # (ranked entries are sorted desc by primary).
+        second = 0.0
+        if len(ranked) >= 2:
+            second = float(ranked[1][1])
+        sig = ConfidenceSignals(
+            top_rerank=float(confidence),
+            second_rerank=second,
+            exact_symbol_match=bool(analysis.symbols and any(
+                (m.get("symbol") or "").split(".")[-1].lower() in
+                {s.lower() for s in analysis.symbols}
+                for m in used_metas
+            )),
+            path_match=bool(analysis.paths and any(
+                p.lower().replace("\\", "/") in (m.get("file") or "").lower().replace("\\", "/")
+                for m in used_metas for p in analysis.paths
+            )),
+            graph_hit=any(m.get("graph_relation") for m in used_metas),
+            test_or_change_hit=any(
+                m.get("chunk_type") in ("test", "change") for m in used_metas
+            ),
+            n_files_cited=len(files_cited),
+            n_blocks_emitted=len(used_metas),
+            query_is_short=len((retrieval_query or "").strip()) < 40,
+        )
+        intent = analysis.note if hasattr(analysis, "note") else None
+        policy, calibrated = decide(sig, intent=intent)
+        confidence = calibrated  # overwrite raw rerank with calibrated value
+        is_low_conf = policy.value in ("AGENTIC_SEARCH", "ASK_CLARIFY")
+        policy_hint = hint_for(policy, calibrated)
+    except Exception as e:
+        logger.debug(f"Confidence calibration skipped: {e}")
+        policy = None
+        policy_hint = ""
+
+    # Attach confidence + policy to every emitted meta — callers (seed
+    # builder, agentic loop) can read it without recomputing.
     for m in used_metas:
         m["confidence"] = confidence
         m["low_confidence"] = is_low_conf
+        if policy is not None:
+            m["policy"] = policy.value
+            m["policy_hint"] = policy_hint
     return context_str, actual_tokens, used_metas
 
 
@@ -887,6 +974,14 @@ def build_messages(
         except Exception as e:
             logger.warning(f"Repo-map injection skipped: {e}")
 
+    # Reuse the agentic prompt's workspace-layout block so one-shot answers
+    # carry the same Continue-Apply-friendly path conventions.
+    try:
+        from src.agentic import _workspace_layout_section
+        workspace_section = _workspace_layout_section()
+    except Exception:
+        workspace_section = ""
+
     system_message = f"""You are an expert software engineer with full semantic access to the codebase.
 {repo_map_block}
 ## Retrieved Codebase Context
@@ -899,7 +994,7 @@ REAL excerpts from the actual repository - treat them as ground truth.
 
 ## Files Referenced Above
 {files_summary}
-
+{workspace_section}
 ## Your Instructions
 - Always cite exact file paths and line numbers when referencing code.
 - If suggesting edits, show precise diffs or full replacement blocks.

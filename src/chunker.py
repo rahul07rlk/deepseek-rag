@@ -128,7 +128,14 @@ def _python_ast_chunks(source: str) -> list[dict] | None:
     return chunks
 
 
-def chunk_file(filepath: Path) -> list[dict]:
+def chunk_file(filepath: Path, recent_change_set: set[str] | None = None) -> list[dict]:
+    """Chunk a file and tag each chunk with a semantic ``chunk_type``.
+
+    ``recent_change_set`` is the set of absolute paths recently modified
+    in git (passed in by the indexer). When this file is in that set,
+    every chunk is stamped ``chunk_type='change'`` so debugging queries
+    can up-rank it.
+    """
     try:
         source = filepath.read_text(encoding="utf-8", errors="ignore")
     except Exception:
@@ -137,13 +144,30 @@ def chunk_file(filepath: Path) -> list[dict]:
         return []
 
     suffix = filepath.suffix
+    chunks: list[dict] = []
     if suffix == ".py":
         ast_chunks = _python_ast_chunks(source)
         if ast_chunks:
-            return ast_chunks
+            chunks = ast_chunks
     elif _ts_supported(suffix):
         ts_chunks = chunk_with_tree_sitter(source, suffix)
         if ts_chunks:
-            return ts_chunks
+            chunks = ts_chunks
+    if not chunks:
+        chunks = _window_chunks(source.splitlines(keepends=True))
 
-    return _window_chunks(source.splitlines(keepends=True))
+    # ── Stamp semantic chunk_type on every chunk. ──────────────────────────
+    from src.chunk_types import classify_chunk
+
+    file_str = str(filepath.resolve())
+    is_changed = bool(recent_change_set) and file_str in recent_change_set
+    for ch in chunks:
+        ch["chunk_type"] = classify_chunk(
+            file_path=file_str,
+            text=ch.get("text", ""),
+            start_line=int(ch.get("start_line") or 1),
+            end_line=int(ch.get("end_line") or 1),
+            symbol=ch.get("symbol"),
+            is_recent_change=is_changed,
+        )
+    return chunks

@@ -26,6 +26,14 @@ _PATH_RE = re.compile(r"[\w./\\-]+\.[A-Za-z]{1,5}\b")
 # CamelCase or camelCase detection (i.e., not plain lowercase or UPPERCASE)
 _MIXED_CASE_RE = re.compile(r"[A-Z][a-z]+[A-Z]|[a-z]+[A-Z][a-z]")
 
+# Well-known files that have no extension but are common query targets.
+# Detected as paths even though _PATH_RE requires an extension suffix.
+_WELL_KNOWN_FILES = frozenset({
+    "readme", "makefile", "dockerfile", "procfile", "gemfile",
+    "cargo", "brewfile", "jenkinsfile", "vagrantfile", "pipfile",
+    "changelog", "contributing", "license", "authors", "codeowners",
+})
+
 # Stop-words we should never treat as code identifiers.
 _PROSE_WORDS = frozenset({
     "how", "why", "what", "when", "where", "which", "who", "whose",
@@ -88,6 +96,12 @@ def analyze(query: str) -> QueryAnalysis:
 
     # File / path mentions first (they consume tokens that look like idents).
     paths = list({m for m in _PATH_RE.findall(q) if not m.startswith(".")})
+    # Also catch well-known extensionless filenames (README, Dockerfile, etc.)
+    # that _PATH_RE misses because they have no dot-extension.
+    q_words = set(re.split(r"\W+", q.lower()))
+    for wkf in _WELL_KNOWN_FILES:
+        if wkf in q_words and wkf not in paths:
+            paths.append(wkf)
 
     # Strip path mentions from the query before identifier extraction so we
     # don't double-count `Auth.tsx` as both a path and the symbol `Auth`.

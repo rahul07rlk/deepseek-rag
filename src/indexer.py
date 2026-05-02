@@ -63,6 +63,30 @@ _store: VectorStore | None = None
 _reranker = None  # CrossEncoder | None — typed loosely to avoid eager import
 _reranker_load_failed = False
 
+# Cached set of recently-changed files (for chunk_type='change' tagging).
+# Populated lazily on first access during an indexing run, valid for the
+# lifetime of that run — re-populated on the next reindex command.
+_recent_change_set_cache: set[str] | None = None
+
+
+def _recent_change_cache() -> set[str]:
+    """Files touched in the last N git commits across all configured repos.
+
+    Result is cached for the duration of the current process so each
+    file's chunker call doesn't shell out to git. The watcher's per-save
+    re-index path passes ``recent_change_set=None`` (default) to skip
+    the lookup entirely on hot saves.
+    """
+    global _recent_change_set_cache
+    if _recent_change_set_cache is not None:
+        return _recent_change_set_cache
+    try:
+        from src.code_graph.extract import collect_recent_changes
+        _recent_change_set_cache = collect_recent_changes(REPO_PATHS, lookback=30)
+    except Exception:
+        _recent_change_set_cache = set()
+    return _recent_change_set_cache
+
 
 def get_model():
     global _model
@@ -487,7 +511,7 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
         elif force and existing_ids:
             removed_replaced += store.delete_by_file(file_str)
 
-        chunks = chunk_file(fpath)
+        chunks = chunk_file(fpath, recent_change_set=_recent_change_cache())
         language = _language(fpath)
         repo_name = next(
             (name for root, name in repo_name_map.items() if file_str.startswith(root + os.sep)),
@@ -508,6 +532,7 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
                 "start_line": ch["start_line"],
                 "end_line": ch["end_line"],
                 "symbol": ch.get("symbol") or "",
+                "chunk_type": ch.get("chunk_type") or "symbol",
                 "hash": fhash,
                 "contextual_version": context_version,
                 "contextual_prefix": contextual_prefix,
@@ -573,6 +598,35 @@ def index_repo(repo_paths: list[Path] | Path = REPO_PATHS, force: bool = False) 
     except Exception as e:
         logger.warning(f"symbol-graph build skipped: {e}")
 
+    # ── Multi-graph rebuild (Kuzu / SQLite swappable). ──────────────────────
+    try:
+        from src.code_graph import rebuild as rebuild_graph
+        gstats = rebuild_graph()
+        logger.info(f"Multi-graph rebuilt: {gstats}")
+    except Exception as e:
+        logger.warning(f"Multi-graph rebuild skipped: {e}")
+
+    # ── Optional LSP enrichment pass — adds ground-truth CALLS edges. ───────
+    try:
+        from src.lsp.enrich import enrich, lsp_enabled
+        if lsp_enabled():
+            logger.info("Running LSP enrichment...")
+            estats = enrich()
+            logger.info(f"LSP enrichment: {estats}")
+    except Exception as e:
+        logger.warning(f"LSP enrichment skipped: {e}")
+
+    # ── Late-interaction (ColBERT) index update. ────────────────────────────
+    try:
+        from src.late_interaction import get_store as li_store
+        li = li_store()
+        if li.available:
+            logger.info("Building late-interaction index...")
+            count = li.index(zip(new_ids, new_docs))
+            logger.info(f"Late-interaction indexed {count} chunks.")
+    except Exception as e:
+        logger.warning(f"Late-interaction skipped: {e}")
+
 
 def index_single_file(filepath: str | Path) -> None:
     fpath = Path(filepath)
@@ -611,7 +665,7 @@ def index_single_file(filepath: str | Path) -> None:
     logger.info(f"Re-indexing: {fpath.name}")
     removed = store.delete_by_file(file_str)
 
-    chunks = chunk_file(fpath)
+    chunks = chunk_file(fpath, recent_change_set=_recent_change_cache())
     if not chunks:
         _update_symbol_graph_for_file(fpath)
         if removed:
